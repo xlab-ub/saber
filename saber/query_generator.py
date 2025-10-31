@@ -385,6 +385,11 @@ ORDER BY year DESC
             api_base=self.api_base
         )
         
+        # Check if response is valid
+        if not response or not response.choices or not response.choices[0].message.content:
+            logger.error(f"LLM returned empty or invalid response: {response}")
+            raise ValueError("LLM query generation failed - received empty response")
+        
         query = response.choices[0].message.content.strip()
         
         # Clean up common formatting issues
