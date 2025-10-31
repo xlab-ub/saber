@@ -229,7 +229,8 @@ class SaberEngine:
         examples: List[Dict] = None,
         backend: str = None,
         max_sample_rows: int = 5,
-        temperature: float = 0.1
+        temperature: float = 0.1,
+        max_tokens: int = 512
     ) -> str:
         """
         Generate SABER SQL query from natural language question.
@@ -242,6 +243,7 @@ class SaberEngine:
             backend: Backend for semantic operations ('lotus' or 'docetl', default: engine's backend)
             max_sample_rows: Number of sample rows to include per table (default: 5)
             temperature: LLM temperature for generation
+            max_tokens: Maximum tokens to generate (default: 512)
             
         Returns:
             Generated SABER SQL query
@@ -268,7 +270,8 @@ class SaberEngine:
                 examples=examples,
                 backend=backend,
                 max_sample_rows=max_sample_rows,
-                temperature=temperature
+                temperature=temperature,
+                max_tokens=max_tokens
             )
         else:
             return self.query_generator.generate(
@@ -278,7 +281,8 @@ class SaberEngine:
                 examples=examples,
                 backend=backend,
                 max_sample_rows=max_sample_rows,
-                temperature=temperature
+                temperature=temperature,
+                max_tokens=max_tokens
             )
     
     def _evaluate_fragment(self, sql_fragment: str) -> pd.DataFrame:
