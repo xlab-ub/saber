@@ -82,11 +82,11 @@ class SemRewriter:
     def _extract_semantic_operations(self, root: exp.Expression):
         self._rewrite_from_clause(root)  # Handle SEM_JOIN first
         self._rewrite_where(root)
-        self._rewrite_select_clause(root)
         self._rewrite_group_by(root)
-        self._rewrite_order_by(root)
-        self._rewrite_distinct(root)
         self._rewrite_agg(root)
+        self._rewrite_select_clause(root)
+        self._rewrite_distinct(root)
+        self._rewrite_order_by(root)
     
     def _collect_needed_columns(self, root: exp.Expression) -> set:
         needed = set()
