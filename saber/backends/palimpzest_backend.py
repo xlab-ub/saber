@@ -23,12 +23,14 @@ from chromadb.utils.embedding_functions.openai_embedding_function import OpenAIE
 from .base_backend import BaseBackend
 from ..config import PALIMPZEST_DEFAULT_MODEL, PALIMPZEST_DEFAULT_EMBEDDING_MODEL
 from ..benchmark import BenchmarkStats, extract_palimpzest_stats
-openai_ef = OpenAIEmbeddingFunction(
-  api_key=os.environ["OPENAI_API_KEY"],
-  model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL,
-)
+# openai_ef = OpenAIEmbeddingFunction(
+#   api_key=os.environ["OPENAI_API_KEY"],
+#   model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL,
+# )
 
 logger = logging.getLogger(__name__)
+
+# TODO: Add support for un-registered vllm models in Palimpzest
 
 @contextmanager
 def temporary_env_var(var_name: str, value: str):
