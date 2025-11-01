@@ -124,7 +124,7 @@ class LOTUSBackend(BaseBackend):
             return self._track_operation(_operation)
         except Exception as e:
             logging.error(f"Error during LOTUS SEM_SELECT: {e}")
-            return df
+            raise  # Re-raise the exception instead of returning original df
     
     def sem_join(self, df1: pd.DataFrame, df2: pd.DataFrame, user_prompt: str,
                 df1_name: str = "left", df2_name: str = "right") -> pd.DataFrame:

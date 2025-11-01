@@ -1,4 +1,5 @@
 import re
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from sqlglot import parse_one, exp
@@ -47,6 +48,7 @@ class SemRewriter:
         self.pending.clear()
         self._alias_counter = 0
         self._semantic_columns.clear()  # Reset semantic columns for each rewrite
+        self._sem_expr_to_alias = {}  # Track mapping from semantic expressions to aliases
         
         try:
             parsed_root = parse_one(sql, dialect=self.dialect)
@@ -80,6 +82,9 @@ class SemRewriter:
             return root
     
     def _extract_semantic_operations(self, root: exp.Expression):
+        # First, recursively process any subqueries in FROM clause
+        self._process_subqueries(root)
+        
         self._rewrite_from_clause(root)  # Handle SEM_JOIN first
         self._rewrite_where(root)
         self._rewrite_group_by(root)
@@ -87,6 +92,19 @@ class SemRewriter:
         self._rewrite_select_clause(root)
         self._rewrite_distinct(root)
         self._rewrite_order_by(root)
+    
+    def _process_subqueries(self, root: exp.Expression):
+        """Recursively process semantic operations in subqueries."""
+        from_clause = root.find(exp.From)
+        if not from_clause:
+            return
+        
+        # Check if FROM contains a subquery
+        if isinstance(from_clause.this, exp.Subquery):
+            subquery_select = from_clause.this.this
+            if isinstance(subquery_select, exp.Select):
+                # Recursively extract semantic operations from the subquery
+                self._extract_semantic_operations(subquery_select)
     
     def _collect_needed_columns(self, root: exp.Expression) -> set:
         needed = set()
@@ -249,6 +267,9 @@ class SemRewriter:
         if not select:
             return
         
+        # Track mapping from semantic expressions to their aliases
+        self._sem_expr_to_alias = {}
+        
         new_expressions = []
         for expr in select.expressions:
             if isinstance(expr, exp.Alias):
@@ -258,6 +279,8 @@ class SemRewriter:
                     args.append(f"'{expr.alias}'")
                     self.pending.add('select', args)
                     self._semantic_columns.add(expr.alias)  # Track semantic column
+                    # Track the mapping from expression to alias
+                    self._sem_expr_to_alias[inner.sql()] = expr.alias
                     new_expressions.append(exp.column(expr.alias))
                 elif isinstance(inner, exp.Anonymous) and inner.name and inner.name.upper() == 'SEM_DISTINCT':
                     args = [arg.sql() for arg in inner.expressions]
@@ -388,7 +411,18 @@ class SemRewriter:
                 final_query += " GROUP BY cluster_id"
             elif not has_semantic_group:
                 # Traditional GROUP BY (no semantic operations)
-                group_by_exprs = [expr.sql() for expr in group_clause.expressions]
+                # But check if any GROUP BY expression matches a semantic SELECT that's been processed
+                group_by_exprs = []
+                for expr in group_clause.expressions:
+                    expr_sql = expr.sql()
+                    # Check if this expression matches a semantic operation in our mapping
+                    if expr_sql in self._sem_expr_to_alias:
+                        # Use the alias instead of the semantic expression
+                        matched_alias = self._sem_expr_to_alias[expr_sql]
+                        group_by_exprs.append(matched_alias)
+                    else:
+                        group_by_exprs.append(expr_sql)
+                
                 final_query += f" GROUP BY {', '.join(group_by_exprs)}"
         
         # Preserve HAVING clause
@@ -437,17 +471,29 @@ class SemRewriter:
             # For semantic set operations, we return a placeholder that won't be executed
             return "SELECT 1 AS placeholder"
         
-        if needed_columns:
-            col_list = ', '.join(sorted(needed_columns))
-        else:
-            col_list = '*'
-        
         table_expr = from_clause.this
-        base_sql = f"SELECT {col_list} FROM {table_expr.sql()}"
         
-        where_clause = root.find(exp.Where)
-        if where_clause and not self._is_true_literal(where_clause.this):
-            base_sql += f" WHERE {where_clause.this.sql()}"
+        # Check if FROM clause contains a subquery (starts with SELECT)
+        # In this case, the subquery already has its own WHERE clause
+        table_sql = table_expr.sql()
+        is_subquery = isinstance(table_expr, exp.Subquery) or (isinstance(table_expr, exp.Table) and table_sql.strip().startswith('('))
+        
+        if is_subquery:
+            # For subqueries, we can only select columns available in its output
+            # Use * to select all available columns from the subquery result
+            base_sql = f"SELECT * FROM {table_sql}"
+        else:
+            # For simple tables, build SELECT with requested columns
+            if needed_columns:
+                col_list = ', '.join(sorted(needed_columns))
+            else:
+                col_list = '*'
+            
+            base_sql = f"SELECT {col_list} FROM {table_sql}"
+            
+            where_clause = root.find(exp.Where)
+            if where_clause and not self._is_true_literal(where_clause.this):
+                base_sql += f" WHERE {where_clause.this.sql()}"
         
         return base_sql
     
@@ -459,7 +505,19 @@ class SemRewriter:
         projections = []
         for expr in select.expressions:
             if isinstance(expr, exp.Alias):
-                projections.append(f"{expr.this.sql()} AS {expr.alias}")
+                # Check if the alias is a semantic column that doesn't exist yet
+                if expr.alias in self._semantic_columns:
+                    # For semantic columns, just reference them directly
+                    projections.append(expr.alias)
+                else:
+                    projections.append(f"{expr.this.sql()} AS {expr.alias}")
+            elif isinstance(expr, exp.Column):
+                # Check if this is a reference to a semantic column
+                if expr.name in self._semantic_columns:
+                    # Just use the column name directly
+                    projections.append(expr.name)
+                else:
+                    projections.append(expr.sql())
             else:
                 projections.append(expr.sql())
         

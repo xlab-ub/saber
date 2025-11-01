@@ -618,57 +618,160 @@ class SaberEngine:
         final_select_pattern = r'SELECT\s+.*?\s+FROM\s+.*?\s+JOIN\s+'
         has_final_join = bool(re.search(final_select_pattern, canonical_sql, re.IGNORECASE | re.DOTALL))
         
-        cte_pattern = r'WITH\s+_child\s+AS\s+\((.*?)\)'
-        match = re.search(cte_pattern, canonical_sql, re.IGNORECASE | re.DOTALL)
+        # Extract base SQL from CTE more carefully to handle parentheses in SQL statements
+        # Use a more robust pattern that looks for the CTE boundary
+        cte_start = canonical_sql.find('WITH _child AS (')
+        if cte_start != -1:
+            # Find the matching closing parenthesis for the CTE
+            # Start after 'WITH _child AS ('
+            paren_start = cte_start + len('WITH _child AS (')
+            paren_count = 1
+            i = paren_start
+            while i < len(canonical_sql) and paren_count > 0:
+                if canonical_sql[i] == '(':
+                    paren_count += 1
+                elif canonical_sql[i] == ')':
+                    paren_count -= 1
+                i += 1
+            
+            if paren_count == 0:
+                base_sql = canonical_sql[paren_start:i-1].strip()
+            else:
+                base_sql = None
+        else:
+            base_sql = None
         
-        if match:
-            base_sql = match.group(1)
+        if base_sql:
             
             # Check if we have set operations (JOIN, INTERSECT, EXCEPT) - if so, skip base SQL execution
             has_set_operation = any(op.op_type in ('join', 'intersect', 'intersect_all', 'except', 'except_all') 
                                    for op in operations)
             
             # Extract the table name from base_sql to get all columns
-            # Pattern: FROM table_name or FROM table_name AS alias
-            table_match = re.search(r'FROM\s+([a-zA-Z_][\w]*)', base_sql, re.IGNORECASE)
-            base_table_name = table_match.group(1) if table_match else None
+            # Pattern: FROM table_name or FROM "table_name" or FROM table_name AS alias
+            # Note: This won't match subqueries like FROM (SELECT ...) alias
+            table_match = re.search(r'FROM\s+(?:"([^"]+)"|([a-zA-Z_][\w]*))', base_sql, re.IGNORECASE)
+            base_table_name = table_match.group(1) if (table_match and table_match.group(1)) else (table_match.group(2) if table_match else None)
+            
+            # Check if base_sql contains a subquery (base_table_name will be None in this case)
+            is_subquery_from = base_table_name is None and 'SELECT' in base_sql.upper()
             
             # If the final SELECT has a JOIN and we have semantic operations, we need to perform JOIN first
             if has_final_join and not has_set_operation:
                 # Extract the JOIN from the final SELECT
-                join_match = re.search(r'FROM\s+(\w+)\s+JOIN\s+(\w+)\s+AS\s+(\w+)\s+ON\s+([^\s]+)\s*=\s*([^\s]+)', 
+                # Pattern handles: FROM table1 JOIN table2 [AS alias] ON col1 = col2
+                # Updated to handle quoted column names like w."Home team"
+                join_match = re.search(r'FROM\s+(\w+)\s+JOIN\s+(\w+)(?:\s+AS\s+(\w+))?\s+ON\s+((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)\s*=\s*((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)', 
                                       canonical_sql, re.IGNORECASE)
                 if join_match:
                     # Get the left table name from base_sql
-                    left_table_match = re.search(r'FROM\s+(\w+)\s+AS\s+(\w+)', base_sql, re.IGNORECASE)
+                    left_table_match = re.search(r'FROM\s+(\w+)(?:\s+AS\s+(\w+))?', base_sql, re.IGNORECASE)
                     if left_table_match:
                         left_table_name = left_table_match.group(1)
-                        left_alias = left_table_match.group(2)
+                        left_alias = left_table_match.group(2) or left_table_name  # Use table name if no alias
                         
                         right_table_name = join_match.group(2)
-                        right_alias = join_match.group(3)
+                        right_alias = join_match.group(3) or right_table_name  # Use table name if no alias
                         left_join_col_raw = join_match.group(4).strip()
                         right_join_col_raw = join_match.group(5).strip()
                         
                         if left_table_name in self._dataframes and right_table_name in self._dataframes:
-                            # Get the full dataframes (not the optimized base_sql result)
-                            left_df = self._dataframes[left_table_name].copy()
+                            # Execute base_sql to get filtered left table (which includes WHERE clauses)
+                            # The base_sql already contains the proper filtering from the original query
+                            try:
+                                # Extract WHERE clause from base_sql if it exists
+                                where_match = re.search(r'WHERE\s+(.+)$', base_sql, re.IGNORECASE | re.DOTALL)
+                                if where_match:
+                                    where_clause = where_match.group(1).strip()
+                                    # Build query with all columns but same WHERE clause
+                                    full_query = f"SELECT * FROM {left_table_name} WHERE {where_clause}"
+                                    left_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                                else:
+                                    # No WHERE clause in base_sql, use full dataframe
+                                    left_df = self._dataframes[left_table_name].copy()
+                            except Exception as e:
+                                logging.warning(f"Failed to execute base_sql for filtering: {e}, using full dataframe")
+                                left_df = self._dataframes[left_table_name].copy()
+                            
                             right_df = self._dataframes[right_table_name].copy()
                             
                             # Add prefixes to column names
                             left_df.columns = [f"{left_alias}.{col}" for col in left_df.columns]
                             right_df.columns = [f"{right_alias}.{col}" for col in right_df.columns]
                             
-                            # Parse join column names (remove table aliases if present)
-                            left_join_col = left_join_col_raw.split('.')[-1]
-                            right_join_col = right_join_col_raw.split('.')[-1]
+                            # Parse join columns: they may have table/alias prefixes like "documents.title" or "d.name"
+                            # We need to determine which column belongs to which dataframe
                             
-                            # Add prefixes for the actual join
-                            left_join_col = f"{left_alias}.{left_join_col}"
-                            right_join_col = f"{right_alias}.{right_join_col}"
+                            def resolve_column(col_ref, left_tbl, left_al, right_tbl, right_al):
+                                """Resolve a column reference to actual column name with correct prefix"""
+                                logging.debug(f"resolve_column input: '{col_ref}'")
+                                
+                                # Handle quoted column names (e.g., w."Home team")
+                                # Match: prefix . "quoted col" OR prefix . unquoted_col
+                                import re
+                                
+                                # Try to match: prefix."quoted column"
+                                quoted_match = re.match(r'([^.]+)\."([^"]+)"', col_ref)
+                                if quoted_match:
+                                    prefix = quoted_match.group(1).strip()
+                                    col_name = quoted_match.group(2).strip()
+                                    logging.debug(f"Matched quoted pattern: prefix='{prefix}', col='{col_name}'")
+                                    
+                                    # Check if prefix matches left or right table/alias
+                                    if prefix in [left_tbl, left_al]:
+                                        return f"{left_al}.{col_name}", 'left'
+                                    elif prefix in [right_tbl, right_al]:
+                                        return f"{right_al}.{col_name}", 'right'
+                                    else:
+                                        return f"{left_al}.{col_name}", 'left'
+                                
+                                # Try to match: prefix.unquoted_column
+                                unquoted_match = re.match(r'([^.]+)\.(.+)', col_ref)
+                                if unquoted_match:
+                                    prefix = unquoted_match.group(1).strip()
+                                    col_name = unquoted_match.group(2).strip()
+                                    logging.debug(f"Matched unquoted pattern: prefix='{prefix}', col='{col_name}'")
+                                    
+                                    # Check if prefix matches left or right table/alias
+                                    if prefix in [left_tbl, left_al]:
+                                        return f"{left_al}.{col_name}", 'left'
+                                    elif prefix in [right_tbl, right_al]:
+                                        return f"{right_al}.{col_name}", 'right'
+                                    else:
+                                        return f"{left_al}.{col_name}", 'left'
+                                
+                                # No prefix, just column name (may be quoted)
+                                col_ref_clean = col_ref.strip('"').strip("'")
+                                logging.debug(f"No prefix, cleaned: '{col_ref_clean}'")
+                                return f"{left_al}.{col_ref_clean}", 'left'
+                            
+                            left_col, left_side = resolve_column(left_join_col_raw, left_table_name, left_alias, right_table_name, right_alias)
+                            right_col, right_side = resolve_column(right_join_col_raw, left_table_name, left_alias, right_table_name, right_alias)
+                            
+                            logging.info(f"Resolved join columns: left='{left_col}' (from {left_side}), right='{right_col}' (from {right_side})")
+                            logging.info(f"Left DF columns: {left_df.columns.tolist()}")
+                            logging.info(f"Right DF columns: {right_df.columns.tolist()}")
+                            
+                            # For pandas merge, we need to know which column is from which DataFrame
+                            # The JOIN condition might be: ON documents.title = d.name
+                            # After resolution: left_col="documents.title" (from right DF), right_col="d.name" (from left DF)
+                            # We need to swap them so left_on is from left_df and right_on is from right_df
+                            if left_side == 'left' and right_side == 'right':
+                                # Standard case: LEFT col = RIGHT col
+                                merge_left_on = left_col
+                                merge_right_on = right_col
+                            elif left_side == 'right' and right_side == 'left':
+                                # Swapped: RIGHT col = LEFT col
+                                merge_left_on = right_col
+                                merge_right_on = left_col
+                            elif left_side == 'left' and right_side == 'left':
+                                # Both from left - this shouldn't happen in a proper join
+                                raise ValueError(f"Both join columns from left table: {left_join_col_raw}, {right_join_col_raw}")
+                            else:  # both from right
+                                raise ValueError(f"Both join columns from right table: {left_join_col_raw}, {right_join_col_raw}")
                             
                             # Perform the join
-                            current_df = left_df.merge(right_df, left_on=left_join_col, right_on=right_join_col, how='inner')
+                            current_df = left_df.merge(right_df, left_on=merge_left_on, right_on=merge_right_on, how='inner')
                         else:
                             # Fall back to SQL execution
                             base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
@@ -685,11 +788,40 @@ class SaberEngine:
                 # No JOIN in final SELECT, execute base SQL normally
                 # But if we have semantic operations, get ALL columns from the base table
                 # so that columns referenced in semantic prompts are available
-                if operations and base_table_name and base_table_name in self._dataframes:
+                
+                # Check if the final query has GROUP BY or aggregations - if so, we need to be careful about
+                # executing base_sql since it might reference aggregated columns that don't exist yet
+                has_group_by = bool(re.search(r'GROUP\s+BY\s+', canonical_sql, re.IGNORECASE))
+                has_agg_ops = any(op.op_type == 'agg' for op in operations)
+                # Also check for traditional SQL aggregations (COUNT, SUM, AVG, etc.) in base_sql or canonical_sql
+                has_traditional_agg = bool(re.search(r'\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(', canonical_sql, re.IGNORECASE))
+                
+                # If we have GROUP BY with aggregations and semantic operations, we need special handling
+                if is_subquery_from:
+                    # For subqueries in FROM clause, execute the base_sql directly
+                    # The subquery is self-contained and already has its filtering
+                    try:
+                        current_df = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                    except Exception as e:
+                        logging.error(f"Failed to execute subquery: {e}")
+                        raise
+                elif operations and base_table_name and base_table_name in self._dataframes and (has_group_by and (has_agg_ops or has_traditional_agg)):
+                    # For GROUP BY with aggregations, start with the base table and apply WHERE only
+                    current_df = self._dataframes[base_table_name].copy()
+                    # Try to apply WHERE clause if present (but not GROUP BY or SELECT with aliases)
+                    where_match = re.search(r'WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|$)', base_sql, re.IGNORECASE | re.DOTALL)
+                    if where_match:
+                        where_clause = where_match.group(1).strip()
+                        full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
+                        try:
+                            current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                        except Exception as e:
+                            logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
+                elif operations and base_table_name and base_table_name in self._dataframes:
                     # Get all columns from the registered table
                     current_df = self._dataframes[base_table_name].copy()
                     # Apply any WHERE clauses from base_sql if present
-                    where_match = re.search(r'WHERE\s+(.+?)(?:ORDER BY|LIMIT|$)', base_sql, re.IGNORECASE | re.DOTALL)
+                    where_match = re.search(r'WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|$)', base_sql, re.IGNORECASE | re.DOTALL)
                     if where_match:
                         # Execute the base SQL to get filtered rows, but select all columns
                         where_clause = where_match.group(1).strip()
@@ -697,12 +829,40 @@ class SaberEngine:
                         full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
                         try:
                             current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
-                        except:
-                            # If WHERE clause fails, just execute the original base_sql
-                            current_df = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                        except Exception as e:
+                            # If WHERE clause fails, fall back to full dataframe
+                            logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
+                            current_df = self._dataframes[base_table_name].copy()
+                elif not (has_group_by and (has_agg_ops or has_traditional_agg)):
+                    # Only execute base_sql directly if there's no GROUP BY with aggregations
+                    # (otherwise base_sql might reference columns that don't exist yet)
+                    try:
+                        base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                        current_df = base_result
+                    except Exception as e:
+                        # If base_sql fails, try to fall back to the base table
+                        if base_table_name and base_table_name in self._dataframes:
+                            logging.warning(f"Failed to execute base_sql: {e}, using base table")
+                            current_df = self._dataframes[base_table_name].copy()
+                        else:
+                            raise
                 else:
-                    base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
-                    current_df = base_result
+                    # For GROUP BY with aggregations, start with the base table
+                    if base_table_name and base_table_name in self._dataframes:
+                        current_df = self._dataframes[base_table_name].copy()
+                        # Try to apply WHERE clause if present
+                        where_match = re.search(r'WHERE\s+(.+?)(?:GROUP BY|ORDER BY|LIMIT|$)', base_sql, re.IGNORECASE | re.DOTALL)
+                        if where_match:
+                            where_clause = where_match.group(1).strip()
+                            full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
+                            try:
+                                current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                            except Exception as e:
+                                logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
+                    else:
+                        # Last resort: try to execute base_sql
+                        base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                        current_df = base_result
             else:
                 # For set operations, we'll start with None and the operation will populate it
                 current_df = None
@@ -933,8 +1093,9 @@ class SaberEngine:
                                 )
                     else:
                         # Regular case: remove the JOIN clause entirely (was handled by upfront JOIN)
+                        # Updated pattern to handle quoted column names
                         final_query = re.sub(
-                            r'FROM\s+_sem_final\s+JOIN\s+\w+\s+AS\s+\w+\s+ON\s+[^\s]+\s*=\s*[^\s]+',
+                            r'FROM\s+_sem_final\s+JOIN\s+\w+(?:\s+AS\s+\w+)?\s+ON\s+((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)\s*=\s*((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)',
                             'FROM _sem_final',
                             final_query,
                             flags=re.IGNORECASE

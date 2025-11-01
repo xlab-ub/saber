@@ -397,7 +397,9 @@ Return only the selected {column} value, nothing else.""",
                     logging.error(f"DocETL {operation_type} command failed with return code {result.returncode}")
                     logging.error(f"STDOUT: {result.stdout}")
                     logging.error(f"STDERR: {result.stderr}")
-                    return df1
+                    # Raise exception instead of returning input dataframe
+                    # This prevents downstream errors when expected columns are missing
+                    raise RuntimeError(f"DocETL {operation_type} operation failed: {result.stderr[:500]}")
                 
                 # Read results
                 if output_file.exists():
@@ -409,14 +411,17 @@ Return only the selected {column} value, nothing else.""",
                     return result_df
                 else:
                     logging.error(f"DocETL output file not found: {output_file}")
-                    return df1
+                    raise RuntimeError(f"DocETL {operation_type} operation failed: output file not found")
                     
         except subprocess.TimeoutExpired:
             logging.error(f"DocETL {operation_type} operation timed out")
-            return df1
+            raise RuntimeError(f"DocETL {operation_type} operation timed out after 300 seconds")
+        except RuntimeError:
+            # Re-raise RuntimeError
+            raise
         except Exception as e:
             logging.error(f"Error during DocETL {operation_type}: {e}")
-            return df1
+            raise RuntimeError(f"DocETL {operation_type} operation failed: {str(e)}")
     
     def sem_where(self, df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
         """Semantic filtering using DocETL."""

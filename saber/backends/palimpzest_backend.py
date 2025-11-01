@@ -12,21 +12,12 @@ import palimpzest as pz
 from palimpzest.core.elements.groupbysig import GroupBySig
 import chromadb
 # from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.utils.embedding_functions.sentence_transformer_embedding_function import SentenceTransformerEmbeddingFunction
 from chromadb.utils.embedding_functions.openai_embedding_function import OpenAIEmbeddingFunction
-# from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-# openai_ef = OpenAIEmbeddingFunction(
-#   api_key=os.environ["OPENAI_API_KEY"],
-#   model_name="text-embedding-3-small",
-# )
 
 from .base_backend import BaseBackend
 from ..config import PALIMPZEST_DEFAULT_MODEL, PALIMPZEST_DEFAULT_EMBEDDING_MODEL
 from ..benchmark import BenchmarkStats, extract_palimpzest_stats
-# openai_ef = OpenAIEmbeddingFunction(
-#   api_key=os.environ["OPENAI_API_KEY"],
-#   model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL,
-# )
 
 logger = logging.getLogger(__name__)
 
@@ -434,21 +425,23 @@ class PalimpzestBackend(BaseBackend):
                 {"name": relevant_col_name, "type": list[str], "desc": f"Relevant {specified_column} based on {user_prompt}"}
             ]
 
-            index = self.chroma_client.create_collection(
-                name="palimpzest_collection", 
-                # embedding_function=SentenceTransformerEmbeddingFunction(),
-                embedding_function=OpenAIEmbeddingFunction(
-                    api_key=os.getenv("OPENAI_API_KEY"),
-                    model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL
-                )
-            )
-            index.add(
-                documents=df[specified_column].tolist(),
-                ids=[f"id{i}" for i in range(1, num_of_records + 1)]
-            )
-
             # Use temporary environment variable for API key
             with temporary_env_var("OPENAI_API_KEY", self.api_key):
+                if self.api_key == 'dummy':
+                    embedding_function = SentenceTransformerEmbeddingFunction()
+                else:
+                    embedding_function = OpenAIEmbeddingFunction(
+                        api_key=os.getenv("OPENAI_API_KEY"),
+                        model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL
+                    )
+                index = self.chroma_client.create_collection(
+                    name="palimpzest_collection", 
+                    embedding_function=embedding_function
+                )
+                index.add(
+                    documents=df[specified_column].tolist(),
+                    ids=[f"id{i}" for i in range(1, num_of_records + 1)]
+                )
                 if hasattr(pz, 'MemoryDataset'):
                     pz_dataset = pz.MemoryDataset(id="temp_dataset", vals=df)
                     pz_dataset = pz_dataset.sem_topk(
@@ -480,40 +473,35 @@ class PalimpzestBackend(BaseBackend):
                 self.last_stats = extract_palimpzest_stats(output.execution_stats)
             
             if relevant_col_name in result_df.columns:
-                # Create a new column with integer indices
-                new_indices = []
+                # Get the relevant list
+                first_relevant_list = result_df[relevant_col_name].iloc[0]
                 
-                for idx, row in result_df.iterrows():
-                    current_value = str(row[specified_column])  # Get the current row's value
-                    relevant_list = row[relevant_col_name]      # Get the list of relevant items
-                    # logging.info(f"relevant_list: {relevant_list}, type: {type(relevant_list)}")
-                    
+                # Handle case where relevant_list is a string representation of a list
+                if isinstance(first_relevant_list, str):
+                    import ast
                     try:
-                        # Handle case where relevant_list is a string representation of a list
-                        if isinstance(relevant_list, str):
-                            # Try to parse the string as a Python list
-                            import ast
-                            try:
-                                relevant_list = ast.literal_eval(relevant_list)
-                            except (ValueError, SyntaxError):
-                                # If parsing fails, treat it as a single item
-                                relevant_list = [relevant_list]
-                        
-                        # Find the exact match index in the relevant list
-                        if isinstance(relevant_list, list) and len(relevant_list) > 0:
-                            if current_value in relevant_list:
-                                position = relevant_list.index(current_value)
-                            else:
-                                # If no exact match found, use the row index as fallback
-                                position = idx
-                        else:
-                            # If relevant_list is empty or not a list, use the row index as fallback
-                            position = idx
-                            
-                    except (ValueError, TypeError, Exception) as e:
-                        logging.error(f"Error processing relevant_list: {e}")
-                        # If any error occurs, use the row index as fallback
-                        position = idx
+                        first_relevant_list = ast.literal_eval(first_relevant_list)
+                    except (ValueError, SyntaxError):
+                        first_relevant_list = [first_relevant_list]
+                
+                # Create mapping from item value to position in relevant list
+                position_map = {}
+                if isinstance(first_relevant_list, list):
+                    for pos, item in enumerate(first_relevant_list):
+                        item_str = str(item)
+                        if item_str not in position_map:
+                            position_map[item_str] = pos
+                
+                # Assign positions to each row
+                new_indices = []
+                for idx, row in result_df.iterrows():
+                    current_value = str(row[specified_column])
+                    
+                    if current_value in position_map:
+                        position = position_map[current_value]
+                    else:
+                        # If not found in relevant list, assign based on row index
+                        position = len(first_relevant_list) + idx
                     
                     new_indices.append(position)
                 
@@ -524,7 +512,6 @@ class PalimpzestBackend(BaseBackend):
                 result_df = result_df.rename(columns={relevant_col_name: '_relevant'})
                 # Sort by the new '_relevant' column
                 result_df = result_df.sort_values(by=['_relevant']).reset_index(drop=True)
-                # logging.info(f"Updated result: {result_df.head(10)}")
 
             logging.info(f"Result of Palimpzest SEM_ORDER_BY: {result_df.head(10)}")
             return result_df
