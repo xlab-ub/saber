@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saber-query"
-version = "0.1.0"
+version = "0.2.0"
 description = "SABER: A SQL-Compatible Semantic Document Processing System Based on Extended Relational Algebra"
 readme = "README.md"
 license = {file = "LICENSE"}
