@@ -21,11 +21,13 @@ logger = logging.getLogger(__name__)
 class DocETLBackend(BaseBackend):
     """DocETL backend for semantic operations using LLM-based document processing."""
     
-    def __init__(self, api_key: str = None, model: str = None, api_base: str = None):
-        super().__init__("docetl", api_key, model, api_base)
+    def __init__(self, api_key: str = None, model: str = None, api_base: str = None, embedding_model: str = None, embedding_api_base: str = None):
+        super().__init__("docetl", api_key, model, api_base, embedding_model, embedding_api_base)
         # Set default model if not provided
         if self.model is None:
             self.model = DOCETL_DEFAULT_MODEL
+        if self.embedding_model is None:
+            self.embedding_model = DOCETL_DEFAULT_EMBEDDING_MODEL
         self.last_stats = BenchmarkStats()
     
     def prepare_dataframe(self, df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, str]]:
@@ -110,6 +112,7 @@ class DocETLBackend(BaseBackend):
                     'concept': 'string',
                     'description': 'string'
                 },
+                'embedding_model': self.embedding_model,
                 'summary_prompt': f'''You are analyzing a cluster of {column} values. Create a representative name and description for this semantic group.
 
 Items in this cluster:
@@ -159,19 +162,19 @@ Make the concept name specific enough to distinguish this group from others, but
                 'optimize': True,
                 'blocking_keys': [column],
                 'blocking_threshold': threshold,
-                'embedding_model': DOCETL_DEFAULT_EMBEDDING_MODEL,
-                'comparison_prompt': f"""CCompare these two {column} entries for semantic similarity:
+                'embedding_model': self.embedding_model,
+                'comparison_prompt': f"""Compare these two {column} entries for semantic similarity:
 
 Entry 1: {{{{ input1.{column} }}}}
 Entry 2: {{{{ input2.{column} }}}}
 
 Consider:
 - Similar meanings despite different wordings
-- Common abbreviations and variations  
+- Common abbreviations and variations
 - Typos and formatting differences
 - Synonyms and alternative names
 
-Are these entries semantically equivalent (representing the same concept)? 
+Are these entries semantically equivalent (representing the same concept)?
 Respond with "True" if they are duplicates, "False" if they are distinct.""",
                 'resolution_prompt': f"""Given the following identified multiple {column} entries that are semantic duplicates:
 {{% for entry in inputs %}}
@@ -615,16 +618,32 @@ Record {{{{ loop.index }}}}: {{{{ item | tojson }}}}
 
         # logging.info(f"Result after resolve operation: {len(result_df)} rows")
         # logging.info(f"Result of DocETL Resolve: {result_df.head(10)}")
-        # remove _kv_pairs_preresolve_resolve_distinct column
-        if '_kv_pairs_preresolve_resolve_distinct' in result_df.columns:
-            result_df = result_df.drop(columns=['_kv_pairs_preresolve_resolve_distinct'])
-            # logging.info(f"Result of DocETL Resolve after dropping internal column: {result_df.head(10)}")
+        # # remove _kv_pairs_preresolve_resolve_distinct column
+        # if '_kv_pairs_preresolve_resolve_distinct' in result_df.columns:
+        #     result_df = result_df.drop(columns=['_kv_pairs_preresolve_resolve_distinct'])
+        #     # logging.info(f"Result of DocETL Resolve after dropping internal column: {result_df.head(10)}")
         
         if len(result_df) > 0:
             # Keep only one row per unique value in the resolved column
             result_df = result_df.drop_duplicates(subset=[column], keep='first')
             # logging.info(f"Final deduplicated result: {len(result_df)} rows")
             # logging.info(f"Final result after deduplication: {result_df.head(10)}")
+        
+        # in '_kv_pairs_preresolve_resolve_distinct' column, there are key-value pairs of original columns
+        # restore original columns from there for the case when original values are needed
+        # then replace the column with the resolved value
+        if '_kv_pairs_preresolve_resolve_distinct' in result_df.columns:
+            def restore_original_columns(row):
+                kv_pairs = row['_kv_pairs_preresolve_resolve_distinct']
+                if isinstance(kv_pairs, dict):
+                    for key, value in kv_pairs.items():
+                        if key == column:
+                            row[key] = value
+                return row
+            
+            result_df = result_df.apply(restore_original_columns, axis=1)
+            result_df = result_df.drop(columns=['_kv_pairs_preresolve_resolve_distinct'])
+            # logging.info(f"Result after restoring original columns: {result_df.head(10)}")
 
         logging.info(f"Result of DocETL SEM_DISTINCT: {result_df.head(10)}")
         return result_df

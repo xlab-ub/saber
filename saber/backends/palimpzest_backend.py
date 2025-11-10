@@ -16,7 +16,7 @@ from chromadb.utils.embedding_functions.sentence_transformer_embedding_function 
 from chromadb.utils.embedding_functions.openai_embedding_function import OpenAIEmbeddingFunction
 
 from .base_backend import BaseBackend
-from ..config import PALIMPZEST_DEFAULT_MODEL, PALIMPZEST_DEFAULT_EMBEDDING_MODEL
+# from ..config import PALIMPZEST_DEFAULT_MODEL, PALIMPZEST_DEFAULT_EMBEDDING_MODEL, LOCAL_EMBEDDING_API_BASE
 from ..benchmark import BenchmarkStats, extract_palimpzest_stats
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,31 @@ def temporary_env_var(var_name: str, value: str):
         elif var_name in os.environ:
             del os.environ[var_name]
 
+@contextmanager
+def temporary_env_vars(env_vars: Dict[str, str]):
+    """Temporarily set multiple environment variables and restore them afterwards."""
+    original_values = {}
+    for var_name, value in env_vars.items():
+        original_values[var_name] = os.environ.get(var_name)
+        if value is not None:
+            os.environ[var_name] = value
+
+    try:
+        yield
+    finally:
+        for var_name, original_value in original_values.items():
+            if original_value is not None:
+                os.environ[var_name] = original_value
+            elif var_name in os.environ:
+                del os.environ[var_name]
+
 
 class PalimpzestBackend(BaseBackend):
     """Palimpzest backend for semantic operations using symbolic programming."""
     
-    def __init__(self, api_key: str = None, model: str = None, api_base: str = None):
-        super().__init__("palimpzest", api_key, model, api_base)
+    def __init__(self, api_key: str = None, model: str = None, api_base: str = None, embedding_model: str = None, embedding_api_base: str = None):
+        super().__init__("palimpzest", api_key, model, api_base, embedding_model, embedding_api_base)
+        # chromadb.api.client.SharedSystemClient.clear_system_cache()
         self.chroma_client = chromadb.Client()
         self.last_stats = BenchmarkStats()
         if not hasattr(pz, 'MemoryDataset'):
@@ -53,10 +72,9 @@ class PalimpzestBackend(BaseBackend):
         if self.model is None:
             from ..config import PALIMPZEST_DEFAULT_MODEL
             self.model = PALIMPZEST_DEFAULT_MODEL
-        # self.config = pz.QueryProcessorConfig(
-        #     # default policy is MaxQuality
-        #     available_models=[PALIMPZEST_DEFAULT_MODEL],
-        # )
+        if self.embedding_model is None:
+            from ..config import PALIMPZEST_DEFAULT_EMBEDDING_MODEL
+            self.embedding_model = PALIMPZEST_DEFAULT_EMBEDDING_MODEL
     
     def __del__(self):
         """Cleanup when destroyed."""
@@ -251,7 +269,7 @@ class PalimpzestBackend(BaseBackend):
                 pz_dataset = pz_dataset.sem_filter(user_prompt)
                 output = pz_dataset.run(config=pz.QueryProcessorConfig(
                     # default policy is MaxQuality
-                    available_models=[PALIMPZEST_DEFAULT_MODEL],
+                    available_models=[self.model],
                 ))
                 result_df = output.to_df()
                 
@@ -285,7 +303,7 @@ class PalimpzestBackend(BaseBackend):
                     pz_dataset = pz_dataset.sem_add_columns([{"name": alias, "type": str, "desc": user_prompt}])
                 output = pz_dataset.run(config=pz.QueryProcessorConfig(
                     # default policy is MaxQuality
-                    available_models=[PALIMPZEST_DEFAULT_MODEL],
+                    available_models=[self.model],
                 ))
                 result_df = output.to_df()
                 
@@ -333,7 +351,7 @@ class PalimpzestBackend(BaseBackend):
                 joined_pz_dataset = left_pz_dataset.sem_join(right_pz_dataset, user_prompt)
                 output = joined_pz_dataset.run(config=pz.QueryProcessorConfig(
                     # default policy is MaxQuality
-                    available_models=[PALIMPZEST_DEFAULT_MODEL],
+                    available_models=[self.model],
                 ))
                 result_df = output.to_df()
             
@@ -382,7 +400,7 @@ class PalimpzestBackend(BaseBackend):
         #         )
         #         output = pz_dataset.run(config=pz.QueryProcessorConfig(
         #             # default policy is MaxQuality
-        #             available_models=[PALIMPZEST_DEFAULT_MODEL],
+        #             available_models=[self.model],
         #         ))
         #         result_df = output.to_df()
         #     logging.info(f"Result of Palimpzest SEM_AGG: {result_df.head(10)}")
@@ -424,16 +442,31 @@ class PalimpzestBackend(BaseBackend):
             relevant_columns = [
                 {"name": relevant_col_name, "type": list[str], "desc": f"Relevant {specified_column} based on {user_prompt}"}
             ]
-
+            env_vars = {}
             # Use temporary environment variable for API key
-            with temporary_env_var("OPENAI_API_KEY", self.api_key):
-                if self.api_key == 'dummy':
-                    embedding_function = SentenceTransformerEmbeddingFunction()
-                else:
-                    embedding_function = OpenAIEmbeddingFunction(
-                        api_key=os.getenv("OPENAI_API_KEY"),
-                        model_name=PALIMPZEST_DEFAULT_EMBEDDING_MODEL
-                    )
+            if self.embedding_model.startswith("litellm_proxy"):
+                env_vars = {
+                    "OPENAI_API_KEY": "-",
+                    "OPENAI_BASE_URL": self.embedding_api_base
+                }
+                embedding_function = OpenAIEmbeddingFunction(
+                    api_key="-",
+                    api_base=self.embedding_api_base,
+                    model_name=self.embedding_model
+                )
+                # OPENAI_BASE_URL = self.embedding_api_base
+                # OPENAI_API_KEY = "-"
+            elif self.api_key in ('dummy', None):
+                embedding_function = SentenceTransformerEmbeddingFunction(model_name=self.embedding_model)
+            else:
+                env_vars = {
+                    "OPENAI_API_KEY": self.api_key,
+                }
+                embedding_function = OpenAIEmbeddingFunction(
+                    api_key=self.api_key,
+                    model_name=self.embedding_model
+                )
+            with temporary_env_vars(env_vars):
                 index = self.chroma_client.create_collection(
                     name="palimpzest_collection", 
                     embedding_function=embedding_function
@@ -463,7 +496,7 @@ class PalimpzestBackend(BaseBackend):
                     )
                 output = pz_dataset.run(config=pz.QueryProcessorConfig(
                     # default policy is MaxQuality
-                    available_models=[PALIMPZEST_DEFAULT_MODEL],
+                    available_models=[self.model],
                 ))
 
             index.delete(ids=[f"id{i}" for i in range(1, num_of_records + 1)])

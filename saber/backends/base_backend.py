@@ -9,22 +9,28 @@ import pandas as pd
 class BaseBackend(ABC):
     """Abstract base class for SABER backends."""
     
-    def __init__(self, name: str, api_key: str = None, model: str = None, api_base: str = None):
+    def __init__(self, name: str, api_key: str = None, model: str = None, api_base: str = None, embedding_model: str = None, embedding_api_base: str = None):
         self.name = name
         self.api_key = api_key
         self.model = model
         self.api_base = api_base
+        self.embedding_model = embedding_model
+        self.embedding_api_base = embedding_api_base
     
     def set_api_key(self, api_key: str):
         """Set or update the API key for this backend."""
         self.api_key = api_key
-    
-    def set_model_config(self, model: str, api_base: str = None, api_key: str = None):
+
+    def set_model_config(self, model: str, api_base: str = None, api_key: str = None, embedding_model: str = None, embedding_api_base: str = None):
         """Set or update the model configuration for this backend."""
         self.model = model
         self.api_base = api_base
         if api_key is not None:
             self.api_key = api_key
+        if embedding_model is not None:
+            self.embedding_model = embedding_model
+        if embedding_api_base is not None:
+            self.embedding_api_base = embedding_api_base
     
     @abstractmethod
     def prepare_dataframe(self, df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, str]]:

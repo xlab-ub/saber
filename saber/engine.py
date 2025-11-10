@@ -9,10 +9,10 @@ from typing import Dict, Any, Optional, List
 import logging
 
 import lotus
-from lotus.models import SentenceTransformersRM, LM
+from lotus.models import SentenceTransformersRM, LM, LiteLLMRM
 from lotus.vector_store import FaissVS 
 
-from .config import LOTUS_DEFAULT_RM_MODEL
+from .config import LOTUS_DEFAULT_RM_MODEL, LOCAL_EMBEDDING_MODEL
 from .llm_config import get_default_llm_config
 from .backends import LOTUSBackend, DocETLBackend, PalimpzestBackend
 from .core import QueryRewriter, SQLParser, SemanticSetOperations, SemRewriter
@@ -40,7 +40,7 @@ class SaberEngine:
     9. SEM_ORDER_BY: Semantic ordering
     """
     
-    def __init__(self, backend: str = 'lotus', openai_api_key: str = None, use_ast_rewriter: bool = True, use_local_llm: bool = False, enable_benchmarking: bool = False):
+    def __init__(self, backend: str = 'lotus', openai_api_key: str = None, use_ast_rewriter: bool = True, use_local_llm: bool = False, enable_benchmarking: bool = False, fallback_enabled: bool = True, max_query_retries: int = 3):
         """
         Initialize SABER Engine.
         
@@ -50,6 +50,8 @@ class SaberEngine:
             use_ast_rewriter: Use AST-based rewriting (recommended) vs regex-based (legacy)
             use_local_llm: Force use of local VLLM instead of OpenAI. Default is False.
             enable_benchmarking: Enable automatic benchmarking for query() and query_ast() calls. Default is False.
+            fallback_enabled: Enable fallback to simple queries when LLM generation fails. Default is True.
+            max_query_retries: Maximum retry attempts for query generation. Default is 3.
         """
         # Initialize DuckDB connection and dataframe storage
         self.conn = duckdb.connect()
@@ -63,13 +65,17 @@ class SaberEngine:
         # Initialize LLM configuration
         self.llm_config = get_default_llm_config(openai_api_key, use_local=use_local_llm)
         
-        # Get API key (may be None for local VLLM mode)
-        api_key = self.llm_config.api_key
-        
         # Initialize LOTUS settings
         lotus_config = self.llm_config.get_model_config('lotus')
         self.lm = LM(model=lotus_config['model'], api_key=lotus_config['api_key'])
-        self.rm = SentenceTransformersRM(model=LOTUS_DEFAULT_RM_MODEL)
+        if use_local_llm:
+            if LOCAL_EMBEDDING_MODEL.startswith("litellm_proxy"):
+                self.rm = LiteLLMRM(model=LOCAL_EMBEDDING_MODEL)
+            else:
+                self.rm = SentenceTransformersRM(model=LOCAL_EMBEDDING_MODEL)
+        else:
+            # self.rm = SentenceTransformersRM(model=LOTUS_DEFAULT_RM_MODEL)
+            self.rm = LiteLLMRM(model=LOTUS_DEFAULT_RM_MODEL)
         self.vs = FaissVS()
         lotus.settings.configure(lm=self.lm, rm=self.rm, vs=self.vs)
         
@@ -82,17 +88,23 @@ class SaberEngine:
             'lotus': LOTUSBackend(
                 api_key=lotus_config['api_key'],
                 model=lotus_config['model'],
-                api_base=lotus_config['api_base']
+                api_base=lotus_config['api_base'],
+                embedding_model=lotus_config.get('embedding_model'),
+                embedding_api_base=lotus_config.get('embedding_api_base')
             ),
             'docetl': DocETLBackend(
                 api_key=docetl_config['api_key'],
                 model=docetl_config['model'],
-                api_base=docetl_config['api_base']
+                api_base=docetl_config['api_base'],
+                embedding_model=docetl_config.get('embedding_model'),
+                embedding_api_base=docetl_config.get('embedding_api_base')
             ), 
             'palimpzest': PalimpzestBackend(
                 api_key=palimpzest_config['api_key'],
                 model=palimpzest_config['model'],
-                api_base=palimpzest_config['api_base']
+                api_base=palimpzest_config['api_base'],
+                embedding_model=palimpzest_config.get('embedding_model'),
+                embedding_api_base=palimpzest_config.get('embedding_api_base')
             )
         }
         
@@ -119,7 +131,9 @@ class SaberEngine:
             model=qg_config['model'],
             api_key=qg_config['api_key'],
             api_base=qg_config['api_base'],
-            backend=backend  # Use engine's default backend
+            backend=backend,
+            max_retries=max_query_retries,
+            fallback_enabled=fallback_enabled
         )
         
         # Initialize benchmark tracker
@@ -192,7 +206,18 @@ class SaberEngine:
         # Update LOTUS configuration
         lotus_config = self.llm_config.get_model_config('lotus')
         self.lm = LM(model=lotus_config['model'], api_key=lotus_config['api_key'])
-        self.rm = SentenceTransformersRM(model=LOTUS_DEFAULT_RM_MODEL)
+        if use_local:
+            if lotus_config['embedding_model'].startswith("litellm_proxy"):
+                self.rm = LiteLLMRM(model=lotus_config['embedding_model'])
+            else:
+                if isinstance(self.rm, SentenceTransformersRM):
+                    del self.rm
+                self.rm = SentenceTransformersRM(model=lotus_config['embedding_model'])
+        else:
+            # self.rm = SentenceTransformersRM(model=LOTUS_DEFAULT_RM_MODEL)
+            self.rm = LiteLLMRM(model=lotus_config['embedding_model'])
+
+        # self.rm = SentenceTransformersRM(model=LOTUS_DEFAULT_RM_MODEL)
         self.vs = FaissVS()
         lotus.settings.configure(lm=self.lm, rm=self.rm, vs=self.vs)
         
@@ -202,7 +227,9 @@ class SaberEngine:
             backend.set_model_config(
                 model=config['model'],
                 api_base=config['api_base'],
-                api_key=config['api_key']
+                api_key=config['api_key'],
+                embedding_model=config.get('embedding_model'),
+                embedding_api_base=config.get('embedding_api_base'),
             )
         
         # Update query rewriter
@@ -218,7 +245,9 @@ class SaberEngine:
             model=query_rewriter_config['model'],
             api_key=query_rewriter_config['api_key'],
             api_base=query_rewriter_config['api_base'],
-            backend=self.default_backend
+            backend=self.default_backend,
+            max_retries=self.query_generator.max_retries,
+            fallback_enabled=self.query_generator.fallback_enabled
         )
     
     def generate(

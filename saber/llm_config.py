@@ -13,12 +13,18 @@ import litellm
 from .config import (
     LOCAL_VLLM_API_BASE,
     LOCAL_VLLM_MODEL,
+    LOCAL_EMBEDDING_API_BASE,
+    LOCAL_EMBEDDING_MODEL,
     OPENAI_DEFAULT_MODEL,
+    OPENAI_DEFAULT_EMBEDDING_MODEL,
     QUERY_REWRITER_DEFAULT_MODEL,
     QUERY_REWRITER_API_BASE,
     LOTUS_DEFAULT_LM_MODEL,
+    LOTUS_DEFAULT_RM_MODEL,
     DOCETL_DEFAULT_MODEL,
+    DOCETL_DEFAULT_EMBEDDING_MODEL,
     PALIMPZEST_DEFAULT_MODEL,
+    PALIMPZEST_DEFAULT_EMBEDDING_MODEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +83,8 @@ class LLMConfig:
                 'model': LOCAL_VLLM_MODEL,
                 'api_base': LOCAL_VLLM_API_BASE,
                 'api_key': 'dummy',  # VLLM doesn't need real API key
+                'embedding_model': LOCAL_EMBEDDING_MODEL,
+                'embedding_api_base': LOCAL_EMBEDDING_API_BASE,
             }
         else:
             # Use OpenAI models for all components
@@ -91,18 +99,24 @@ class LLMConfig:
                     'model': LOTUS_DEFAULT_LM_MODEL,
                     'api_base': None,
                     'api_key': self.api_key,
+                    'embedding_model': LOTUS_DEFAULT_RM_MODEL,
+                    'embedding_api_base': None,
                 }
             elif component == 'docetl':
                 return {
                     'model': DOCETL_DEFAULT_MODEL,
                     'api_base': None,
                     'api_key': self.api_key,
+                    'embedding_model': DOCETL_DEFAULT_EMBEDDING_MODEL,
+                    'embedding_api_base': None,
                 }
             elif component == 'palimpzest':
                 return {
                     'model': PALIMPZEST_DEFAULT_MODEL,
                     'api_base': None,
                     'api_key': self.api_key,
+                    'embedding_model': PALIMPZEST_DEFAULT_EMBEDDING_MODEL,
+                    'embedding_api_base': None,
                 }
             else:
                 raise ValueError(f"Unknown component: {component}")
@@ -147,11 +161,32 @@ class LLMConfig:
                 api_base=LOCAL_VLLM_API_BASE,
                 messages=[{"role": "user", "content": "test"}],
                 max_tokens=5,
-                timeout=5,
+                timeout=10,
             )
             return True
         except Exception as e:
             logging.error(f"Local VLLM not available: {e}")
+            return False
+    
+    @staticmethod
+    def test_local_embedding() -> bool:
+        """
+        Test if local embedding model is available and working.
+        
+        Returns:
+            True if local embedding model is accessible, False otherwise
+        """
+        try:
+            response = litellm.embedding(
+                model=LOCAL_EMBEDDING_MODEL,
+                api_base=LOCAL_EMBEDDING_API_BASE,
+                api_key="-",
+                input=["test"],
+                timeout=10,
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Local embedding model not available: {e}")
             return False
     
     @staticmethod

@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 class LOTUSBackend(BaseBackend):
     """LOTUS backend for semantic operations using embedding-based similarity."""
     
-    def __init__(self, api_key: str = None, model: str = None, api_base: str = None):
-        super().__init__("LOTUS", api_key, model, api_base)
+    def __init__(self, api_key: str = None, model: str = None, api_base: str = None, embedding_model: str = None, embedding_api_base: str = None):
+        super().__init__("LOTUS", api_key, model, api_base, embedding_model, embedding_api_base)
         self.last_stats = BenchmarkStats()
         self._lm = None  # Will be set by engine
     
