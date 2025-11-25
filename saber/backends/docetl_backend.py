@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional, List
 import logging
 import pandas as pd
+import litellm
 
 from .base_backend import BaseBackend
 from ..config import DOCETL_DEFAULT_MODEL, DOCETL_DEFAULT_EMBEDDING_MODEL, DOCETL_DEFAULT_RESOLVE_THRESHOLD
@@ -29,6 +30,16 @@ class DocETLBackend(BaseBackend):
         if self.embedding_model is None:
             self.embedding_model = DOCETL_DEFAULT_EMBEDDING_MODEL
         self.last_stats = BenchmarkStats()
+    
+    def _get_output_mode(self) -> str:
+        """Determine output mode based on function calling support.
+        
+        Returns 'tools' for models that support function calling, 'structured_output' otherwise.
+        """
+        if litellm.supports_function_calling(self.model):
+            return 'tools'
+        else:
+            return 'structured_output'
     
     def prepare_dataframe(self, df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, str]]:
         """Replace dots in column names with underscores for DocETL."""
@@ -95,7 +106,8 @@ class DocETLBackend(BaseBackend):
                 'output': {
                     'schema': {
                         'matches_criteria': 'boolean'
-                    }
+                    },
+                    'mode': self._get_output_mode()
                 }
             }
         elif operation_type == 'cluster':
@@ -138,7 +150,8 @@ Make the concept name specific enough to distinguish this group from others, but
                     'schema': {
                         # reduce_key: 'string',
                         alias: 'string'
-                    }
+                    },
+                    'mode': self._get_output_mode()
                 },
                 'prompt': user_prompt
             }
@@ -150,7 +163,8 @@ Make the concept name specific enough to distinguish this group from others, but
                 'output': {
                     'schema': {
                         alias: 'string'
-                    }
+                    },
+                    'mode': self._get_output_mode()
                 }
             }
         elif operation_type == 'resolve':
@@ -191,7 +205,8 @@ Return only the selected {column} value, nothing else.""",
                 'output': {
                     'schema': {
                         column: 'string'
-                    }
+                    },
+                    'mode': self._get_output_mode()
                 }
             }
         elif operation_type == 'rank':
@@ -284,9 +299,10 @@ Return only the selected {column} value, nothing else.""",
                 if possible_columns:
                     cluster_column = possible_columns[0]
                 else:
-                    logging.info("No cluster column found, adding default cluster_id")
-                    df['cluster_id'] = 'cluster_001'
-                    return df
+                    # logging.info("No cluster column found, adding default cluster_id")
+                    # df['cluster_id'] = 'cluster_001'
+                    # return df
+                    raise ValueError("No cluster information column found in DocETL output.")
             
             cluster_ids = []
             cluster_names = []
@@ -433,21 +449,46 @@ Return only the selected {column} value, nothing else.""",
         
         result_df = self._run_operation('filter', df_docetl, updated_prompt)
         
-        if not result_df.empty and column_mapping:
+        if column_mapping:
             result_df = self.restore_dataframe(result_df, column_mapping)
+        
+        # Ensure columns are preserved even when empty
+        if result_df.empty and not df.empty:
+            result_df = pd.DataFrame(columns=df.columns)
 
         logging.info(f"Result of DocETL SEM_WHERE: {result_df.head(10)}")
         return result_df
     
     def sem_select(self, df: pd.DataFrame, user_prompt: str, alias: str) -> pd.DataFrame:
         """Semantic selection using DocETL."""
+        # Ensure alias doesn't conflict with existing columns
+        unique_alias = self._ensure_unique_alias(df, alias)
+        
         df_docetl, column_mapping = self.prepare_dataframe(df)
         updated_prompt = self.update_prompt(user_prompt, column_mapping)
 
-        result_df = self._run_operation('select', df_docetl, updated_prompt, alias=alias)
+        result_df = self._run_operation('select', df_docetl, updated_prompt, alias=unique_alias)
     
         if not result_df.empty and column_mapping:
             result_df = self.restore_dataframe(result_df, column_mapping)
+        
+        # Validate result quality
+        if unique_alias in result_df.columns:
+            null_count = result_df[unique_alias].isna().sum()
+            total_count = len(result_df)
+            if null_count == total_count and total_count > 0:
+                logger.warning(
+                    f"DocETL SEM_SELECT column '{unique_alias}' contains only NULL values. "
+                    f"Prompt may be unclear: {user_prompt[:80]}..."
+                )
+            elif null_count > total_count * 0.5:
+                logger.warning(
+                    f"DocETL SEM_SELECT '{unique_alias}' has {null_count}/{total_count} NULL values."
+                )
+        
+        # Ensure columns are preserved even when empty
+        if result_df.empty and not df.empty:
+            result_df = pd.DataFrame(columns=df.columns.tolist() + [unique_alias])
         
         logging.info(f"Result of DocETL SEM_SELECT: {result_df.head(10)}")
         return result_df
@@ -476,11 +517,19 @@ Return only the selected {column} value, nothing else.""",
     
     def sem_group_by(self, df: pd.DataFrame, column: str, number_of_groups: int) -> pd.DataFrame:
         """Semantic grouping using DocETL."""
-        result_df = self._run_operation('cluster', df, '', column=column, number_of_groups=number_of_groups)
-
-        if result_df.empty:
-            logging.error("DocETL cluster returned an empty DataFrame.")
+        if litellm.supports_function_calling(self.model):
+            result_df = self._run_operation('cluster', df, '', column=column, number_of_groups=number_of_groups)
+            if result_df.empty:
+                logging.error("DocETL cluster returned an empty DataFrame.")
+                result_df = df
+        else:
+            logging.error("DocETL requires a LLM that supports function calling for clustering operations.")
             result_df = df
+            result_df = self._process_cluster_output(result_df)
+
+        # if result_df.empty:
+        #     logging.error("DocETL cluster returned an empty DataFrame.")
+        #     result_df = df
         # else:
         #     # Create a mapping of items to their cluster assignments
         #     cluster_mapping = {}
@@ -546,8 +595,16 @@ Record {{{{ loop.index }}}}: {{{{ item | tojson }}}}
             # Case 2: Aggregation with regular SQL GROUP BY columns
             reduce_key = group_by_col[0]  # Use first GROUP BY column as reduce key
             
+            # Validate reduce_key exists in dataframe
             if reduce_key not in df.columns:
-                raise ValueError(f"GROUP BY column '{reduce_key}' not found in DataFrame columns: {df.columns.tolist()}")
+                # Check if it's a computed column (like from SUBSTRING_INDEX)
+                # Try to extract the actual column name from expressions
+                actual_cols = [col for col in df.columns if reduce_key.startswith(col)]
+                if not actual_cols:
+                    # Cannot find the column - this is likely from SEM_AGG that was called on a dataframe
+                    # that doesn't have the expected columns (e.g., SEM_AGG created a new column that isn't in df)
+                    logger.error(f"GROUP BY column '{reduce_key}' not found in DataFrame columns: {df.columns.tolist()}")
+                    raise ValueError(f"GROUP BY column '{reduce_key}' not found in DataFrame columns: {df.columns.tolist()}")
             
             if column:
                 # Focus on specific column for aggregation

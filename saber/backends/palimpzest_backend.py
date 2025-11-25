@@ -273,12 +273,23 @@ class PalimpzestBackend(BaseBackend):
                 ))
                 result_df = output.to_df()
                 
+                # Convert complex types (list/dict) to string to avoid MySQL type conversion errors
+                for col in result_df.columns:
+                    if result_df[col].dtype == 'object':
+                        result_df[col] = result_df[col].apply(
+                            lambda x: str(x) if isinstance(x, (list, dict)) else x
+                        )
+                
                 # Extract stats
                 if hasattr(output, 'execution_stats'):
                     self.last_stats = extract_palimpzest_stats(output.execution_stats)
 
-            if not result_df.empty and column_mapping:
+            if column_mapping:
                 result_df = self.restore_dataframe(result_df, column_mapping)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns)
 
             logging.info(f"Result of Palimpzest SEM_WHERE: {result_df.head(10)}")
             return result_df
@@ -290,6 +301,8 @@ class PalimpzestBackend(BaseBackend):
     
     def sem_select(self, df: pd.DataFrame, user_prompt: str, alias: str) -> pd.DataFrame:
         """Semantic selection using Palimpzest."""
+        # Ensure alias doesn't conflict with existing columns
+        unique_alias = self._ensure_unique_alias(df, alias)
         try:
             df_palimpzest, column_mapping = self.prepare_dataframe(df)
 
@@ -297,15 +310,22 @@ class PalimpzestBackend(BaseBackend):
             with temporary_env_var("OPENAI_API_KEY", self.api_key):
                 if hasattr(pz, 'MemoryDataset'):
                     pz_dataset = pz.MemoryDataset(id="temp_dataset", vals=df_palimpzest)
-                    pz_dataset = pz_dataset.sem_map([{"name": alias, "type": str, "desc": user_prompt}])
+                    pz_dataset = pz_dataset.sem_map([{"name": unique_alias, "type": str, "desc": user_prompt}])
                 else:
                     pz_dataset = pz.Dataset(source=df_palimpzest)
-                    pz_dataset = pz_dataset.sem_add_columns([{"name": alias, "type": str, "desc": user_prompt}])
+                    pz_dataset = pz_dataset.sem_add_columns([{"name": unique_alias, "type": str, "desc": user_prompt}])
                 output = pz_dataset.run(config=pz.QueryProcessorConfig(
                     # default policy is MaxQuality
                     available_models=[self.model],
                 ))
                 result_df = output.to_df()
+                
+                # Convert complex types (list/dict) to string to avoid MySQL type conversion errors
+                for col in result_df.columns:
+                    if result_df[col].dtype == 'object':
+                        result_df[col] = result_df[col].apply(
+                            lambda x: str(x) if isinstance(x, (list, dict)) else x
+                        )
                 
                 # Extract stats
                 if hasattr(output, 'execution_stats'):
@@ -313,6 +333,10 @@ class PalimpzestBackend(BaseBackend):
 
             if not result_df.empty and column_mapping:
                 result_df = self.restore_dataframe(result_df, column_mapping)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns.tolist() + [unique_alias])
 
             logging.info(f"Result of Palimpzest SEM_SELECT: {result_df.head(10)}")
             return result_df

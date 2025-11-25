@@ -38,7 +38,9 @@ class SQLParser:
             'intersect_all': r"SEM_INTERSECT_ALL\s*\(\s*(.+?)\s*\)",
         }
         
-        self.from_pattern = r"FROM\s+(\w+)"
+        # Updated patterns to handle quoted identifiers (backticks, double quotes, single quotes)
+        # Match either: unquoted word OR `quoted name` OR "quoted name" OR 'quoted name'
+        self.from_pattern = r"FROM\s+(?:`([^`]+)`|\"([^\"]+)\"|'([^']+)'|(\w+))"
         self.from_join_pattern = r'\b(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)(?:\s+AS)?\s+([a-zA-Z0-9_]+)'
         self.join_pattern = r'FROM\s+(\w+)(?:\s+AS\s+(\w+))?\s+JOIN\s+(\w+)(?:\s+AS\s+(\w+))?\s+ON\s+([^W\s][^H\s][^E\s][^R\s][^E\s]*?)(?=\s+WHERE|\s+GROUP|\s+ORDER|\s+LIMIT|\s*$)'
     
@@ -58,8 +60,27 @@ class SQLParser:
         return aliases
     
     def extract_table_matches(self, sql: str) -> List[str]:
-        """Extract table names from FROM clauses."""
-        return re.findall(self.from_pattern, sql, re.IGNORECASE)
+        """
+        Extract table names from FROM clauses, handling quoted identifiers.
+        
+        Note: For unquoted multi-word table names (e.g., "FROM My Table"), only the first
+        word will be extracted since SQL treats them as separate tokens. However, the
+        db_adapter's table name normalization will still handle the full table name correctly
+        when executing queries.
+        """
+        matches = re.findall(self.from_pattern, sql, re.IGNORECASE)
+        # Flatten tuples from alternation groups - one of the 4 groups will match
+        # Result is list of tuples like ('', '', '', 'table_name') or ('table name', '', '', '')
+        result = []
+        for match in matches:
+            if isinstance(match, tuple):
+                # Get the non-empty group
+                table_name = next((m for m in match if m), None)
+                if table_name:
+                    result.append(table_name)
+            else:
+                result.append(match)
+        return result
     
     def has_regular_join(self, sql: str) -> bool:
         """Check if SQL contains regular JOIN operations."""

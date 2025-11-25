@@ -32,6 +32,31 @@ class BaseBackend(ABC):
         if embedding_api_base is not None:
             self.embedding_api_base = embedding_api_base
     
+    def _ensure_unique_alias(self, df: pd.DataFrame, alias: str) -> str:
+        """
+        Ensure the alias doesn't conflict with existing column names (case-insensitive).
+        
+        Args:
+            df: DataFrame with existing columns
+            alias: Proposed alias name
+            
+        Returns:
+            Unique alias name
+        """
+        # Get existing column names in lowercase for case-insensitive comparison
+        existing_cols_lower = {col.lower() for col in df.columns}
+        
+        # Check if alias conflicts
+        if alias.lower() not in existing_cols_lower:
+            return alias
+        
+        # Find a unique name by appending a suffix
+        suffix = 1
+        while f"{alias}_{suffix}".lower() in existing_cols_lower:
+            suffix += 1
+        
+        return f"{alias}_{suffix}"
+    
     @abstractmethod
     def prepare_dataframe(self, df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, str]]:
         """

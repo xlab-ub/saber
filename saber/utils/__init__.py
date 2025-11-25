@@ -18,6 +18,8 @@ from .embedding_utils import (
     encode_dataframe_for_similarity
 )
 
+from .db_adapter import DatabaseAdapter
+
 __all__ = [
     'quote_dot_columns',
     'get_column_context',
@@ -25,5 +27,6 @@ __all__ = [
     'prepare_df_columns',
     'restore_df_columns',
     'compute_similarity_matches',
-    'encode_dataframe_for_similarity'
+    'encode_dataframe_for_similarity',
+    'DatabaseAdapter'
 ]

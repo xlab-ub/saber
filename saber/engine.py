@@ -3,7 +3,6 @@ SABER Engine Implementation
 """
 import re
 import time
-import duckdb
 import pandas as pd
 from typing import Dict, Any, Optional, List
 import logging
@@ -16,7 +15,7 @@ from .config import LOTUS_DEFAULT_RM_MODEL, LOCAL_EMBEDDING_MODEL
 from .llm_config import get_default_llm_config
 from .backends import LOTUSBackend, DocETLBackend, PalimpzestBackend
 from .core import QueryRewriter, SQLParser, SemanticSetOperations, SemRewriter
-from .utils import quote_dot_columns, get_column_context
+from .utils import quote_dot_columns, get_column_context, DatabaseAdapter
 from .query_generator import SABERQueryGenerator
 from .benchmark import BenchmarkTracker, BenchmarkStats, extract_lotus_stats
 
@@ -40,7 +39,7 @@ class SaberEngine:
     9. SEM_ORDER_BY: Semantic ordering
     """
     
-    def __init__(self, backend: str = 'lotus', openai_api_key: str = None, use_ast_rewriter: bool = True, use_local_llm: bool = False, enable_benchmarking: bool = False, fallback_enabled: bool = True, max_query_retries: int = 3):
+    def __init__(self, backend: str = 'lotus', openai_api_key: str = None, use_ast_rewriter: bool = True, use_local_llm: bool = False, enable_benchmarking: bool = False, fallback_enabled: bool = True, max_query_retries: int = 3, db_type: str = 'duckdb', **db_kwargs):
         """
         Initialize SABER Engine.
         
@@ -52,9 +51,13 @@ class SaberEngine:
             enable_benchmarking: Enable automatic benchmarking for query() and query_ast() calls. Default is False.
             fallback_enabled: Enable fallback to simple queries when LLM generation fails. Default is True.
             max_query_retries: Maximum retry attempts for query generation. Default is 3.
+            db_type: Database type ('duckdb', 'sqlite', 'mysql'). Default is 'duckdb'.
+            **db_kwargs: Additional database connection parameters (e.g., host, user, password for MySQL)
         """
-        # Initialize DuckDB connection and dataframe storage
-        self.conn = duckdb.connect()
+        # Initialize database connection and dataframe storage
+        self.db_adapter = DatabaseAdapter(db_type, **db_kwargs)
+        self.conn = self.db_adapter.conn
+        self.db_type = db_type.lower()
         self._dataframes = {}
         
         # Set default backend for query rewriting
@@ -123,7 +126,7 @@ class SaberEngine:
         self.semantic_ops = SemanticSetOperations(self.backends)
         
         if use_ast_rewriter:
-            self.ast_rewriter = SemRewriter(dialect='duckdb')
+            self.ast_rewriter = SemRewriter(dialect=self.db_type)
         
         # Initialize query generator
         qg_config = self.llm_config.get_model_config('query_rewriter')
@@ -133,7 +136,8 @@ class SaberEngine:
             api_base=qg_config['api_base'],
             backend=backend,
             max_retries=max_query_retries,
-            fallback_enabled=fallback_enabled
+            fallback_enabled=fallback_enabled,
+            db_type=db_type
         )
         
         # Initialize benchmark tracker
@@ -165,6 +169,27 @@ class SaberEngine:
         logger.debug(f"SQL execution time: {elapsed_time:.2f}s")
         return result
     
+    def _execute_normalized_sql(self, sql: str):
+        """Execute SQL with database-specific normalization and timing."""
+        # Normalize SQL outside of timing (this is preprocessing)
+        normalized_sql = DatabaseAdapter.normalize_sql_for_db(sql, self.db_type)
+        
+        # Track only the actual SQL execution time
+        try:
+            return self._track_sql_execution(lambda: self._execute_sql_direct(normalized_sql))
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Provide helpful error messages for common compatibility issues
+            if 'INT)' in error_msg or 'AS INT' in error_msg:
+                logger.error(f"CAST type error - {self.db_type.upper()} may not support this CAST type. Use SIGNED/UNSIGNED (MySQL) or INTEGER (SQLite/DuckDB)")
+            elif 'SUBSTRING_INDEX' in error_msg:
+                logger.error(f"SUBSTRING_INDEX not supported in {self.db_type.upper()}")
+            elif 'DATEDIFF' in error_msg:
+                logger.error(f"DATEDIFF syntax error - {self.db_type.upper()} may require different arguments")
+            
+            raise
+    
     def _track_rewriting_time(self, func, *args, **kwargs):
         """Track time spent rewriting backend-free queries."""
         if not self.enable_benchmarking:
@@ -184,7 +209,17 @@ class SaberEngine:
     def register_table(self, name: str, df: pd.DataFrame):
         """Register table for vectorized processing."""
         self._dataframes[name] = df.copy()
-        self.conn.register(name, df)
+        self.db_adapter.register(name, df)
+    
+    def _execute_sql(self, sql: str):
+        """Execute SQL with automatic normalization (convenience wrapper)."""
+        normalized_sql = DatabaseAdapter.normalize_sql_for_db(sql, self.db_type)
+        return self._execute_sql_direct(normalized_sql)
+    
+    def _execute_sql_direct(self, sql: str):
+        """Execute SQL directly without normalization (raw execution)."""
+        cursor = self.db_adapter.execute(sql)
+        return self.db_adapter.fetch_df(cursor)
     
     def get_backend(self, backend_name: str):
         """Get a specific backend instance."""
@@ -247,7 +282,8 @@ class SaberEngine:
             api_base=query_rewriter_config['api_base'],
             backend=self.default_backend,
             max_retries=self.query_generator.max_retries,
-            fallback_enabled=self.query_generator.fallback_enabled
+            fallback_enabled=self.query_generator.fallback_enabled,
+            db_type=self.db_type
         )
     
     def generate(
@@ -259,7 +295,8 @@ class SaberEngine:
         backend: str = None,
         max_sample_rows: int = 5,
         temperature: float = 0.1,
-        max_tokens: int = 512
+        max_tokens: int = 512,
+        llm_verification: bool = True
     ) -> str:
         """
         Generate SABER SQL query from natural language question.
@@ -273,6 +310,7 @@ class SaberEngine:
             max_sample_rows: Number of sample rows to include per table (default: 5)
             temperature: LLM temperature for generation
             max_tokens: Maximum tokens to generate (default: 512)
+            llm_verification: Enable LLM-powered verification and optimization (default: True)
             
         Returns:
             Generated SABER SQL query
@@ -300,7 +338,8 @@ class SaberEngine:
                 backend=backend,
                 max_sample_rows=max_sample_rows,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                llm_verification=llm_verification
             )
         else:
             return self.query_generator.generate(
@@ -311,7 +350,8 @@ class SaberEngine:
                 backend=backend,
                 max_sample_rows=max_sample_rows,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                llm_verification=llm_verification
             )
     
     def _evaluate_fragment(self, sql_fragment: str) -> pd.DataFrame:
@@ -399,7 +439,7 @@ class SaberEngine:
             intersect_df = self.semantic_ops.intersect_operation(df1, df2, self.rm, is_set=is_set)
 
             view_name = f"temp_intersect_{'set' if is_set else 'all'}_{idx}"
-            self.conn.register(view_name, intersect_df)
+            self.db_adapter.register(view_name, intersect_df)
 
             start, end = span
             sql = sql[:start + offset] + view_name + sql[end + offset:]
@@ -416,7 +456,7 @@ class SaberEngine:
             diff_df = self.semantic_ops.except_operation(df1, df2, self.rm, is_set=is_set)
 
             view_name = f"temp_except_{'set' if is_set else 'all'}_{idx}"
-            self.conn.register(view_name, diff_df)
+            self.db_adapter.register(view_name, diff_df)
 
             start, end = span
             sql = sql[:start + offset] + view_name + sql[end + offset:]
@@ -636,6 +676,27 @@ class SaberEngine:
             result = self._execute_with_semantic_ops(canonical_sql, operations)
             return result
             
+        except ValueError as ve:
+            # SQL parsing errors from AST rewriter
+            error_msg = str(ve)
+            if "Failed to parse SQL" in error_msg:
+                logging.warning(f"SQL parsing error in AST rewriter: {error_msg}")
+                
+                # Check if the query has any semantic operations
+                # If not, fall back to direct SQL execution
+                has_semantic_ops = any(pattern in sql.upper() for pattern in [
+                    'SEM_WHERE', 'SEM_SELECT', 'SEM_JOIN', 'SEM_GROUP_BY', 
+                    'SEM_AGG', 'SEM_DISTINCT', 'SEM_ORDER_BY', 'SEM_INTERSECT', 'SEM_EXCEPT'
+                ])
+                
+                if not has_semantic_ops:
+                    logging.warning("No semantic operations detected, falling back to direct SQL execution")
+                    return self._track_sql_execution(lambda: self._execute_sql(sql))
+                else:
+                    logging.error(f"Problematic SQL with semantic operations: {sql[:500]}...")
+                    raise RuntimeError(f"Failed to parse SQL query with semantic operations. This may be due to unsupported SQL syntax or dialect-specific features. Error: {error_msg}")
+            else:
+                raise
         except Exception as e:
             logging.error(f"Error in AST execution: {e}")
             import traceback
@@ -646,6 +707,10 @@ class SaberEngine:
         # Check if the final SELECT contains a JOIN
         final_select_pattern = r'SELECT\s+.*?\s+FROM\s+.*?\s+JOIN\s+'
         has_final_join = bool(re.search(final_select_pattern, canonical_sql, re.IGNORECASE | re.DOTALL))
+        
+        # Log canonical SQL for debugging
+        logger.debug(f"Executing canonical SQL with {len(operations)} semantic operations")
+        logger.debug(f"Canonical SQL preview: {canonical_sql[:200]}...")
         
         # Extract base SQL from CTE more carefully to handle parentheses in SQL statements
         # Use a more robust pattern that looks for the CTE boundary
@@ -677,10 +742,12 @@ class SaberEngine:
                                    for op in operations)
             
             # Extract the table name from base_sql to get all columns
-            # Pattern: FROM table_name or FROM "table_name" or FROM table_name AS alias
+            # Pattern: FROM table_name or FROM "table_name" or FROM `table_name` or FROM table_name AS alias
             # Note: This won't match subqueries like FROM (SELECT ...) alias
-            table_match = re.search(r'FROM\s+(?:"([^"]+)"|([a-zA-Z_][\w]*))', base_sql, re.IGNORECASE)
-            base_table_name = table_match.group(1) if (table_match and table_match.group(1)) else (table_match.group(2) if table_match else None)
+            table_match = re.search(r'FROM\s+(?:"([^"]+)"|`([^`]+)`|([a-zA-Z_][\w]*))', base_sql, re.IGNORECASE)
+            base_table_name = (table_match.group(1) if (table_match and table_match.group(1)) 
+                             else (table_match.group(2) if (table_match and table_match.group(2))
+                             else (table_match.group(3) if table_match else None)))
             
             # Check if base_sql contains a subquery (base_table_name will be None in this case)
             is_subquery_from = base_table_name is None and 'SELECT' in base_sql.upper()
@@ -689,8 +756,8 @@ class SaberEngine:
             if has_final_join and not has_set_operation:
                 # Extract the JOIN from the final SELECT
                 # Pattern handles: FROM table1 JOIN table2 [AS alias] ON col1 = col2
-                # Updated to handle quoted column names like w."Home team"
-                join_match = re.search(r'FROM\s+(\w+)\s+JOIN\s+(\w+)(?:\s+AS\s+(\w+))?\s+ON\s+((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)\s*=\s*((?:\w+\.)?"[^"]+"|(?:\w+\.)?[\w]+)', 
+                # Updated to handle quoted column names like w."Home team" and backticked names
+                join_match = re.search(r'FROM\s+(\w+)\s+JOIN\s+(\w+)(?:\s+AS\s+(\w+))?\s+ON\s+((?:\w+\.)?(?:"[^"]+"|`[^`]+`|[\w]+))\s*=\s*((?:\w+\.)?(?:"[^"]+"|`[^`]+`|[\w]+))', 
                                       canonical_sql, re.IGNORECASE)
                 if join_match:
                     # Get the left table name from base_sql
@@ -714,7 +781,7 @@ class SaberEngine:
                                     where_clause = where_match.group(1).strip()
                                     # Build query with all columns but same WHERE clause
                                     full_query = f"SELECT * FROM {left_table_name} WHERE {where_clause}"
-                                    left_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                                    left_df = self._track_sql_execution(lambda: self._execute_sql(full_query))
                                 else:
                                     # No WHERE clause in base_sql, use full dataframe
                                     left_df = self._dataframes[left_table_name].copy()
@@ -803,16 +870,17 @@ class SaberEngine:
                             current_df = left_df.merge(right_df, left_on=merge_left_on, right_on=merge_right_on, how='inner')
                         else:
                             # Fall back to SQL execution
-                            base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                            def execute_and_fetch():
+                                cursor = self.db_adapter.execute(base_sql)
+                                return self.db_adapter.fetch_df(cursor)
+                            base_result = self._track_sql_execution(execute_and_fetch)
                             current_df = base_result
                     else:
                         # Couldn't parse base_sql, fall back
-                        base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
-                        current_df = base_result
+                        current_df = self._track_sql_execution(lambda: self._execute_sql(base_sql))
                 else:
                     # Couldn't parse JOIN, fall back to normal execution
-                    base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
-                    current_df = base_result
+                    current_df = self._track_sql_execution(lambda: self._execute_sql(base_sql))
             elif not has_set_operation:
                 # No JOIN in final SELECT, execute base SQL normally
                 # But if we have semantic operations, get ALL columns from the base table
@@ -830,7 +898,7 @@ class SaberEngine:
                     # For subqueries in FROM clause, execute the base_sql directly
                     # The subquery is self-contained and already has its filtering
                     try:
-                        current_df = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
+                        current_df = self._track_sql_execution(lambda: self._execute_sql(base_sql))
                     except Exception as e:
                         logging.error(f"Failed to execute subquery: {e}")
                         raise
@@ -843,7 +911,10 @@ class SaberEngine:
                         where_clause = where_match.group(1).strip()
                         full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
                         try:
-                            current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                            def execute_and_fetch():
+                                cursor = self.db_adapter.execute(full_query)
+                                return self.db_adapter.fetch_df(cursor)
+                            current_df = self._track_sql_execution(execute_and_fetch)
                         except Exception as e:
                             logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
                 elif operations and base_table_name and base_table_name in self._dataframes:
@@ -857,7 +928,7 @@ class SaberEngine:
                         # Construct a query that selects all columns with the WHERE clause
                         full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
                         try:
-                            current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                            current_df = self._track_sql_execution(lambda: self._execute_sql(full_query))
                         except Exception as e:
                             # If WHERE clause fails, fall back to full dataframe
                             logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
@@ -866,8 +937,7 @@ class SaberEngine:
                     # Only execute base_sql directly if there's no GROUP BY with aggregations
                     # (otherwise base_sql might reference columns that don't exist yet)
                     try:
-                        base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
-                        current_df = base_result
+                        current_df = self._track_sql_execution(lambda: self._execute_sql(base_sql))
                     except Exception as e:
                         # If base_sql fails, try to fall back to the base table
                         if base_table_name and base_table_name in self._dataframes:
@@ -885,13 +955,12 @@ class SaberEngine:
                             where_clause = where_match.group(1).strip()
                             full_query = f"SELECT * FROM {base_table_name} WHERE {where_clause}"
                             try:
-                                current_df = self._track_sql_execution(lambda: self.conn.execute(full_query).fetch_df())
+                                current_df = self._track_sql_execution(lambda: self._execute_sql(full_query))
                             except Exception as e:
                                 logging.warning(f"Failed to execute WHERE clause: {e}, using full dataframe")
                     else:
                         # Last resort: try to execute base_sql
-                        base_result = self._track_sql_execution(lambda: self.conn.execute(base_sql).fetch_df())
-                        current_df = base_result
+                        current_df = self._track_sql_execution(lambda: self._execute_sql(base_sql))
             else:
                 # For set operations, we'll start with None and the operation will populate it
                 current_df = None
@@ -902,11 +971,29 @@ class SaberEngine:
             # Extract GROUP BY columns from the final SELECT query for SEM_AGG
             group_by_columns = []
             final_query_preview = canonical_sql.split('\n')[-1]
-            group_by_match = re.search(r'GROUP\s+BY\s+([^\s]+(?:\s*,\s*[^\s]+)*)', final_query_preview, re.IGNORECASE)
+            group_by_match = re.search(r'GROUP\s+BY\s+([^\s]+(?:\s*,\s*[^\s]+)*?)(?:\s+ORDER|\s+HAVING|\s+LIMIT|$)', final_query_preview, re.IGNORECASE)
             if group_by_match:
                 # Extract column names from GROUP BY clause
                 group_by_str = group_by_match.group(1).strip()
-                group_by_columns = [col.strip() for col in group_by_str.split(',')]
+                
+                # Handle SEM_SELECT in GROUP BY - look for the alias in the SELECT clause
+                if 'SEM_SELECT' in group_by_str.upper():
+                    # Find corresponding alias from SELECT clause
+                    # Pattern: SEM_SELECT(...) AS alias
+                    select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query_preview, re.IGNORECASE | re.DOTALL)
+                    if select_match:
+                        select_clause = select_match.group(1)
+                        # Look for SEM_SELECT with AS clause
+                        sem_select_matches = re.findall(r'SEM_SELECT\s*\([^)]+\)\s*AS\s+(\w+)', select_clause, re.IGNORECASE)
+                        if sem_select_matches:
+                            group_by_columns = sem_select_matches
+                            logger.debug(f"Extracted GROUP BY columns from SEM_SELECT aliases: {group_by_columns}")
+                else:
+                    # Strip quotes from column names (both " and `)
+                    group_by_columns = [col.strip().strip('"').strip('`') for col in group_by_str.split(',') if col.strip()]
+                    
+                # Filter out empty strings
+                group_by_columns = [col for col in group_by_columns if col]
             
             for op in operations:
                 # Backend selection depends on operation type
@@ -1057,7 +1144,28 @@ class SaberEngine:
                     self._accumulate_backend_stats(backend_impl)
             
             # Register the result as final temp table and execute the final SELECT
-            self.conn.register('_sem_final', current_df)
+            self.db_adapter.register('_sem_final', current_df)
+            
+            # Handle user-defined CTEs - if canonical SQL has user CTEs like:
+            # , win_years AS (SELECT yr FROM _sem_2)
+            # We need to materialize them by replacing _sem_N with _sem_final
+            user_cte_pattern = r',\s+(\w+)\s+AS\s+\(([^)]+)\)\s*(?:SELECT|$)'
+            user_cte_matches = list(re.finditer(user_cte_pattern, canonical_sql, re.IGNORECASE))
+            for cte_match in user_cte_matches:
+                cte_name = cte_match.group(1)
+                cte_query = cte_match.group(2).strip()
+                # Skip our generated CTEs (_child, _sem_N)
+                if cte_name.startswith('_'):
+                    continue
+                # Replace _sem_N with _sem_final in the CTE query
+                cte_query = re.sub(r'_sem_\d+', '_sem_final', cte_query)
+                # Execute the CTE query to create the named table
+                logger.debug(f"Materializing user CTE '{cte_name}': {cte_query}")
+                cte_result = self._execute_sql(cte_query)
+                self.db_adapter.register(cte_name, cte_result)
+            
+            # Log available columns for debugging
+            logger.debug(f"Columns in current_df before final SELECT: {current_df.columns.tolist()}")
             
             # Track SEM_AGG aliases for wrapping in ANY_VALUE() if needed
             sem_agg_aliases = [op.args[3].strip("'") if len(op.args) == 4 else op.args[2].strip("'") 
@@ -1071,18 +1179,77 @@ class SaberEngine:
                 final_query = canonical_sql.split('\n')[-1]
                 final_query = re.sub(r'_sem_\d+', '_sem_final', final_query)
                 
-                # If the final query has GROUP BY, wrap SEM_AGG columns in ANY_VALUE()
+                # MySQL ONLY_FULL_GROUP_BY compatibility: wrap non-grouped columns in ANY_VALUE()
                 if re.search(r'\bGROUP\s+BY\b', final_query, re.IGNORECASE):
-                    for alias in sem_agg_aliases:
-                        # Replace bare alias with ANY_VALUE(alias) in SELECT clause
-                        # Match: SELECT ..., alias, ... or SELECT alias, ...
-                        # Don't match if already wrapped (e.g., ANY_VALUE(alias))
-                        pattern = r'\b' + re.escape(alias) + r'\b(?!\s*\))'  # Not followed by )
-                        # Only replace in SELECT clause (before FROM)
-                        select_part, _, rest = final_query.partition(' FROM ')
-                        if select_part:
-                            select_part = re.sub(pattern, f'ANY_VALUE({alias})', select_part)
-                            final_query = select_part + ' FROM ' + rest
+                    if self.db_type == 'mysql':
+                        # Extract GROUP BY columns
+                        group_by_match = re.search(r'GROUP\s+BY\s+([^\s]+)(?:\s+ORDER|\s+LIMIT|$)', final_query, re.IGNORECASE)
+                        if group_by_match:
+                            group_by_cols = {col.strip() for col in group_by_match.group(1).split(',')}
+                            
+                            # Extract SELECT columns (before FROM)
+                            select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
+                            if select_match:
+                                select_clause = select_match.group(1)
+                                
+                                # Parse SELECT columns and wrap non-GROUP BY columns in ANY_VALUE()
+                                select_parts = []
+                                for part in select_clause.split(','):
+                                    part = part.strip()
+                                    
+                                    # Extract alias if present (e.g., "col AS alias" or "func() AS alias")
+                                    alias_match = re.search(r'\s+AS\s+(\w+)\s*$', part, re.IGNORECASE)
+                                    if alias_match:
+                                        alias = alias_match.group(1)
+                                        expr = part[:alias_match.start()].strip()
+                                    else:
+                                        # No alias, the part itself is the column
+                                        alias = part
+                                        expr = part
+                                    
+                                    # Check if this is in GROUP BY or is an aggregate function
+                                    is_grouped = alias in group_by_cols or expr in group_by_cols
+                                    is_aggregate = bool(re.search(r'\b(COUNT|SUM|AVG|MIN|MAX|ANY_VALUE)\s*\(', expr, re.IGNORECASE))
+                                    
+                                    # Wrap in ANY_VALUE if not grouped and not already aggregated
+                                    if not is_grouped and not is_aggregate:
+                                        if alias_match:
+                                            select_parts.append(f'ANY_VALUE({expr}) AS {alias}')
+                                        else:
+                                            select_parts.append(f'ANY_VALUE({part})')
+                                    else:
+                                        select_parts.append(part)
+                                
+                                # Rebuild SELECT clause
+                                new_select = 'SELECT ' + ', '.join(select_parts) + ' FROM'
+                                final_query = re.sub(r'SELECT\s+.*?\s+FROM', new_select, final_query, count=1, flags=re.IGNORECASE | re.DOTALL)
+                        
+                        # Fix ORDER BY to reference ANY_VALUE wrapped columns
+                        order_by_match = re.search(r'ORDER\s+BY\s+([^\s,]+)', final_query, re.IGNORECASE)
+                        if order_by_match and group_by_match:
+                            order_col = order_by_match.group(1).strip()
+                            group_by_cols = {col.strip() for col in group_by_match.group(1).split(',')}
+                            
+                            # If ORDER BY column is not in GROUP BY, wrap it in ANY_VALUE
+                            if order_col not in group_by_cols and not re.search(r'\b(COUNT|SUM|AVG|MIN|MAX|ANY_VALUE)\s*\(', order_col, re.IGNORECASE):
+                                final_query = re.sub(
+                                    r'ORDER\s+BY\s+' + re.escape(order_col),
+                                    f'ORDER BY ANY_VALUE({order_col})',
+                                    final_query,
+                                    flags=re.IGNORECASE
+                                )
+                    else:
+                        # For non-MySQL databases, just wrap SEM_AGG aliases
+                        for alias in sem_agg_aliases:
+                            # Replace bare alias with ANY_VALUE(alias) in SELECT clause
+                            # Match: SELECT ..., alias, ... or SELECT alias, ...
+                            # Don't match if already wrapped (e.g., ANY_VALUE(alias))
+                            pattern = r'\b' + re.escape(alias) + r'\b(?!\s*\))'  # Not followed by )
+                            # Only replace in SELECT clause (before FROM)
+                            select_part, _, rest = final_query.partition(' FROM ')
+                            if select_part:
+                                select_part = re.sub(pattern, f'ANY_VALUE({alias})', select_part)
+                                final_query = select_part + ' FROM ' + rest
                 
                 # If we performed a JOIN upfront, remove the JOIN clause from final query
                 if has_final_join:
@@ -1131,13 +1298,177 @@ class SaberEngine:
                         )
                 
                 # Quote columns with dots for proper SQL execution
-                final_query = quote_dot_columns(final_query, current_df.columns.tolist())
-                result = self._track_sql_execution(lambda: self.conn.execute(final_query).fetch_df())
+                final_query = quote_dot_columns(final_query, current_df.columns.tolist(), self.db_type)
+                
+                # Remove any remaining semantic function calls from the final query
+                # These should have been processed already, but sometimes they appear in GROUP BY or ORDER BY
+                sem_func_pattern = r'\bSEM_(SELECT|WHERE|AGG|ORDER_BY|GROUP_BY|JOIN|DISTINCT|INTERSECT|EXCEPT)\s*\([^)]*\)'
+                if re.search(sem_func_pattern, final_query, re.IGNORECASE):
+                    logger.warning(f"Found semantic function calls in final SQL query - these should have been removed by AST rewriter")
+                    logger.warning(f"Query with semantic functions: {final_query}")
+                    
+                    # For GROUP BY, use the already-extracted group_by_columns if available
+                    # This prevents empty GROUP BY clauses
+                    group_by_match = re.search(r'GROUP\s+BY\s+(.*?)(?:\s+ORDER|\s+HAVING|\s+LIMIT|$)', final_query, re.IGNORECASE)
+                    if group_by_match:
+                        group_by_clause = group_by_match.group(1).strip()
+                        if 'SEM_SELECT' in group_by_clause.upper() or 'SEM_GROUP_BY' in group_by_clause.upper():
+                            # Use the columns extracted earlier in the execution loop
+                            if group_by_columns:
+                                new_group_by = ', '.join(group_by_columns)
+                                final_query = re.sub(
+                                    r'GROUP\s+BY\s+.*?(?=\s+ORDER|\s+HAVING|\s+LIMIT|$)',
+                                    f'GROUP BY {new_group_by}',
+                                    final_query,
+                                    count=1,
+                                    flags=re.IGNORECASE
+                                )
+                                logger.info(f"Replaced GROUP BY with extracted columns: {new_group_by}")
+                            else:
+                                # Fallback: try to extract alias from SELECT clause
+                                select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
+                                if select_match:
+                                    select_clause = select_match.group(1)
+                                    # Find SEM_SELECT or SEM_GROUP_BY with AS alias
+                                    sem_alias_matches = re.findall(r'(?:SEM_SELECT|SEM_GROUP_BY)\s*\([^)]+\)\s*AS\s+(\w+)', select_clause, re.IGNORECASE)
+                                    if sem_alias_matches:
+                                        new_group_by = ', '.join(sem_alias_matches)
+                                        final_query = re.sub(
+                                            r'GROUP\s+BY\s+.*?(?=\s+ORDER|\s+HAVING|\s+LIMIT|$)',
+                                            f'GROUP BY {new_group_by}',
+                                            final_query,
+                                            count=1,
+                                            flags=re.IGNORECASE
+                                        )
+                                        logger.info(f"Replaced GROUP BY with aliases from SELECT: {new_group_by}")
+                                    else:
+                                        logger.error("Cannot find GROUP BY columns - removing GROUP BY clause")
+                                        final_query = re.sub(r'GROUP\s+BY\s+.*?(?=\s+ORDER|\s+HAVING|\s+LIMIT|$)', '', final_query, count=1, flags=re.IGNORECASE)
+                    
+                    # For ORDER BY, similar replacement
+                    final_query = re.sub(
+                        r'ORDER\s+BY\s+SEM_SELECT\s*\([^)]+\)\s*AS\s+(\w+)',
+                        r'ORDER BY \1',
+                        final_query,
+                        flags=re.IGNORECASE
+                    )
+                    
+                    # Additional GROUP BY fix: replace any remaining SEM_* functions in GROUP BY with actual column names from _sem_final
+                    group_by_match = re.search(r'GROUP\s+BY\s+(.*?)(?=\s+ORDER|\s+HAVING|\s+LIMIT|$)', final_query, re.IGNORECASE | re.DOTALL)
+                    if group_by_match and current_df is not None:
+                        group_by_clause = group_by_match.group(1)
+                        # Check if GROUP BY still contains SEM_* functions
+                        if re.search(r'SEM_\w+\s*\(', group_by_clause, re.IGNORECASE):
+                            logger.warning(f"GROUP BY still contains semantic functions after initial replacement: {group_by_clause}")
+                            # Try to match semantic functions in GROUP BY with columns in current_df
+                            # Extract all SEM_* function calls in GROUP BY
+                            sem_funcs_in_group = re.findall(r'SEM_\w+\s*\([^)]+\)', group_by_clause, re.IGNORECASE)
+                            if sem_funcs_in_group:
+                                # For each SEM function, try to find the corresponding column in SELECT clause
+                                select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
+                                if select_match:
+                                    select_clause = select_match.group(1)
+                                    replacement_map = {}
+                                    for sem_func in sem_funcs_in_group:
+                                        # Find this same function in SELECT with an alias
+                                        alias_match = re.search(rf'{re.escape(sem_func)}\s+AS\s+(\w+)', select_clause, re.IGNORECASE)
+                                        if alias_match:
+                                            replacement_map[sem_func] = alias_match.group(1)
+                                            logger.info(f"Mapping GROUP BY function {sem_func} to column {alias_match.group(1)}")
+                                    
+                                    # Apply replacements
+                                    if replacement_map:
+                                        for sem_func, col_name in replacement_map.items():
+                                            group_by_clause = group_by_clause.replace(sem_func, col_name)
+                                        final_query = re.sub(
+                                            r'GROUP\s+BY\s+.*?(?=\s+ORDER|\s+HAVING|\s+LIMIT|$)',
+                                            f'GROUP BY {group_by_clause}',
+                                            final_query,
+                                            count=1,
+                                            flags=re.IGNORECASE
+                                        )
+                                        logger.info(f"Replaced GROUP BY semantic functions with column names: {group_by_clause}")
+                    
+                    # Remove standalone SEM_WHERE from SELECT clause (common error)
+                    # SEM_WHERE should only be in WHERE clause, not SELECT
+                    select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
+                    if select_match:
+                        select_clause = select_match.group(1)
+                        if 'SEM_WHERE' in select_clause.upper():
+                            logger.error("SEM_WHERE found in SELECT clause - this is invalid. Removing it.")
+                            # Remove SEM_WHERE from SELECT, keeping other columns
+                            cleaned_select = re.sub(r',?\s*SEM_WHERE\s*\([^)]*\)\s*(?:AS\s+\w+)?\s*,?', '', select_clause, flags=re.IGNORECASE)
+                            cleaned_select = re.sub(r'^\s*,|,\s*$', '', cleaned_select).strip()  # Clean up extra commas
+                            if not cleaned_select or cleaned_select == ',':
+                                cleaned_select = '*'  # Fallback to SELECT *
+                            final_query = re.sub(r'SELECT\s+.*?\s+FROM', f'SELECT {cleaned_select} FROM', final_query, count=1, flags=re.IGNORECASE | re.DOTALL)
+                    
+                    # Remove other standalone SEM_* functions that shouldn't be there
+                    final_query = re.sub(sem_func_pattern, '', final_query, flags=re.IGNORECASE)
+                    
+                    # Clean up any resulting double spaces or trailing commas
+                    final_query = re.sub(r'\s+', ' ', final_query)
+                    final_query = re.sub(r',\s*,', ',', final_query)
+                    final_query = re.sub(r',\s*FROM', ' FROM', final_query, flags=re.IGNORECASE)
+                    
+                    logger.info(f"Cleaned final query: {final_query}")
+                
+                # Remove MySQL-incompatible syntax
+                if self.db_type == 'mysql':
+                    # MySQL doesn't support NULLS FIRST/LAST
+                    final_query = re.sub(r'\s+NULLS\s+(FIRST|LAST)', '', final_query, flags=re.IGNORECASE)
+                
+                # Execute final query with error handling
+                try:
+                    result = self._execute_normalized_sql(final_query)
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # Handle "Unknown column" errors - these might be from semantic operations
+                    if 'Unknown column' in error_msg or 'not found' in error_msg.lower():
+                        logger.warning(f"Column resolution error: {error_msg}")
+                        logger.warning(f"Available columns in _sem_final: {current_df.columns.tolist()}")
+                        logger.warning(f"Final query attempted: {final_query}")
+                        
+                        # Try to extract what columns are actually being selected
+                        select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
+                        if select_match:
+                            requested_cols = [col.strip() for col in select_match.group(1).split(',')]
+                            logger.warning(f"Requested columns: {requested_cols}")
+                            
+                            # Check if any requested columns don't exist in current_df
+                            missing_cols = [col for col in requested_cols if col not in current_df.columns and col != '*' and col != 'DISTINCT']
+                            if missing_cols:
+                                logger.error(f"Missing columns in result DataFrame: {missing_cols}")
+                                logger.error(f"This likely means the backend semantic operation failed to create the expected columns")
+                                # Return the current_df directly instead of trying to SELECT
+                                logger.warning("Returning current DataFrame directly instead of executing SELECT")
+                                return current_df
+                            
+                            # Fallback: just select all columns from current_df
+                            logger.warning("Falling back to SELECT * FROM _sem_final")
+                            fallback_query = re.sub(r'SELECT\s+.*?\s+FROM', 'SELECT * FROM', final_query, count=1, flags=re.IGNORECASE | re.DOTALL)
+                            result = self._execute_normalized_sql(fallback_query)
+                        else:
+                            raise
+                    elif 'does not exist' in error_msg and 'FUNCTION' in error_msg:
+                        # Function doesn't exist (e.g., unsupported database-specific function)
+                        logger.error(f"Database function not supported in {self.db_type}: {error_msg}")
+                        logger.error(f"This likely means the query used a function that couldn't be normalized. "
+                                   f"Consider using semantic operations (SEM_SELECT, SEM_WHERE, etc.) instead.")
+                        raise
+                    elif 'syntax' in error_msg.lower() and ('int)' in error_msg.lower() or 'cast' in error_msg.lower()):
+                        # CAST type compatibility issue
+                        logger.error(f"CAST type incompatibility with {self.db_type}: {error_msg}")
+                        logger.error(f"The query may be using incorrect type casting syntax for {self.db_type}")
+                        raise
+                    else:
+                        raise
                 return result
             else:
                 return current_df
         else:
-            return self._track_sql_execution(lambda: self.conn.execute(canonical_sql).fetch_df())
+            return self._track_sql_execution(lambda: self._execute_sql(canonical_sql))
     
     def explain(self, sql: str) -> str:
         if not self.use_ast_rewriter:
@@ -1355,7 +1686,7 @@ class SaberEngine:
                 else:
                     raise ValueError(f"Tables '{left_table}' or '{right_table}' not found in registered dataframes.")
             
-            # 2. Semantic WHERE clauses
+            # 2. Semantic WHERE clauses (apply each filter sequentially)
             for user_prompt, system in semantic_ops['where']:
                 backend = self.get_backend(system)
                 df = backend.sem_where(df, user_prompt)
@@ -1401,7 +1732,7 @@ class SaberEngine:
             
             # Register processed data and modify SQL
             temp_table = f"{table_name}_vectorized"
-            self.conn.register(temp_table, df)
+            self.db_adapter.register(temp_table, df)
 
             # Store column names for rollback after processing
             column_names_rollback = [] 
@@ -1417,7 +1748,8 @@ class SaberEngine:
                 modified_sql = sql.replace(f"FROM {table_name}", f"FROM {temp_table}")
             
             if semantic_ops['where']:
-                modified_sql = re.sub(self.sql_parser.patterns['where'], "TRUE", modified_sql)
+                for _ in semantic_ops['where']:
+                    modified_sql = re.sub(self.sql_parser.patterns['where'], "TRUE", modified_sql, count=1)
             
             if semantic_ops['group']:
                 for column, number_of_groups, system in semantic_ops['group']:
@@ -1471,10 +1803,10 @@ class SaberEngine:
                         raise NotImplementedError(f"Semantic ORDER BY not implemented for backend '{system}'")
 
             # Quote columns with dots and replace table name
-            modified_sql = quote_dot_columns(modified_sql, df)
+            modified_sql = quote_dot_columns(modified_sql, df, self.db_type)
             logging.info(f"Final modified SQL for execution:\n{modified_sql}\n")
 
-            result = self._track_sql_execution(lambda: self.conn.sql(modified_sql).df())
+            result = self._track_sql_execution(lambda: self.db_adapter.sql(modified_sql).df())
 
             # Remove internal columns from result if they exist
             internal_columns = ['_semantic_order', '_rank', '_relevant']
@@ -1489,7 +1821,10 @@ class SaberEngine:
             
             # Cleanup
             try:
-                self.conn.execute(f"DROP VIEW IF EXISTS {temp_table}")
+                if self.db_type == 'duckdb':
+                    self.db_adapter.execute(f"DROP VIEW IF EXISTS {temp_table}")
+                else:
+                    self.db_adapter.execute(f"DROP TABLE IF EXISTS {temp_table}")
             except:
                 pass
 
@@ -1507,14 +1842,17 @@ class SaberEngine:
         # Clean up temporary table
         if temp_table_name:
             try:
-                self.conn.execute(f"DROP VIEW IF EXISTS {temp_table_name}")
+                if self.db_type == 'duckdb':
+                    self.db_adapter.execute(f"DROP VIEW IF EXISTS {temp_table_name}")
+                else:
+                    self.db_adapter.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
                 if temp_table_name in self._dataframes:
                     del self._dataframes[temp_table_name]
             except:
                 pass
         
         # Execute final SQL
-        return self._track_sql_execution(lambda: self.conn.sql(sql).df())
+        return self._track_sql_execution(lambda: self.db_adapter.sql(sql).df())
     
     def reset_benchmark(self):
         """Reset benchmark statistics."""

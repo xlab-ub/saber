@@ -90,33 +90,230 @@ class LOTUSBackend(BaseBackend):
         
         return updated_prompt
     
+    def _validate_column_references(self, prompt: str, df: pd.DataFrame, operation_name: str = "semantic operation") -> str:
+        """Validate that all column references in prompt exist in the DataFrame."""
+        # Extract column references from prompt: {column_name} pattern
+        column_refs = re.findall(r'\{([^}]+)\}', prompt)
+        
+        if not column_refs:
+            # No column references found - LOTUS will reject this
+            # Auto-add the most appropriate column reference
+            logger.warning(f"{operation_name}: No column references found in prompt, will add fallback")
+            
+            # Find text columns as candidates
+            text_cols = [col for col in df.columns if df[col].dtype == 'object' or str(df[col].dtype) == 'string']
+            if not text_cols:
+                # Fallback to any column
+                text_cols = list(df.columns)
+            
+            if text_cols:
+                # Prepend column reference to prompt
+                fallback_prompt = f"{{{text_cols[0]}}} {prompt}"
+                logger.info(f"{operation_name}: Added fallback column reference: {fallback_prompt[:100]}")
+                return fallback_prompt
+            else:
+                logger.warning(f"{operation_name}: No columns available for fallback")
+                return prompt
+        
+        available_cols = set(df.columns)
+        missing_cols = []
+        
+        for col_ref in column_refs:
+            # Clean column reference: remove backticks, quotes, and extra spaces
+            clean_ref = col_ref.strip().replace('`', '').replace('"', '').replace("'", '')
+            
+            # Handle table.column references
+            if '.' in clean_ref or ':' in clean_ref:
+                # Extract just the column name part
+                parts = re.split(r'[.:]', clean_ref)
+                col_name = parts[-1].strip() if parts else clean_ref
+            else:
+                col_name = clean_ref
+            
+            # Case-insensitive check
+            if not any(col_name.lower() == avail_col.lower() for avail_col in available_cols):
+                missing_cols.append(col_ref)
+        
+        if missing_cols:
+            # Attempt to resolve missing columns
+            resolved_prompt = prompt
+            still_missing = []
+            
+            for missing_ref in missing_cols:
+                # Clean the reference again
+                clean_ref = missing_ref.strip().replace('`', '').replace('"', '').replace("'", '')
+                if '.' in clean_ref:
+                    col_name = clean_ref.split('.')[-1].strip()
+                else:
+                    col_name = clean_ref
+                
+                # Strategy 1: Check if the column name exists without table prefix
+                # (e.g. {table.col} -> {col})
+                if any(col_name.lower() == avail_col.lower() for avail_col in available_cols):
+                    # Find the exact match in available columns
+                    matched_col = next(avail_col for avail_col in available_cols if col_name.lower() == avail_col.lower())
+                    pattern = r'\{' + re.escape(missing_ref) + r'\}'
+                    replacement = '{' + matched_col + '}'
+                    resolved_prompt = re.sub(pattern, replacement, resolved_prompt)
+                    logger.info(f"{operation_name}: Resolved {missing_ref} to {{{matched_col}}}")
+                    continue
+                
+                # Strategy 2: Check for suffix match (e.g. {long_table_name_col} -> {col})
+                # or {col} -> {table_col}
+                suffix_match = None
+                for avail_col in available_cols:
+                    if avail_col.lower().endswith(col_name.lower()) or col_name.lower().endswith(avail_col.lower()):
+                        # Only accept if it's a significant match (len > 3) to avoid false positives
+                        if len(col_name) > 3 and len(avail_col) > 3:
+                            suffix_match = avail_col
+                            break
+                
+                if suffix_match:
+                    pattern = r'\{' + re.escape(missing_ref) + r'\}'
+                    replacement = '{' + suffix_match + '}'
+                    resolved_prompt = re.sub(pattern, replacement, resolved_prompt)
+                    logger.info(f"{operation_name}: Fuzzy resolved {missing_ref} to {{{suffix_match}}}")
+                    continue
+                
+                still_missing.append(missing_ref)
+            
+            if not still_missing:
+                return resolved_prompt
+                
+            # Fallback: if only one column available, replace missing references with it
+            if len(available_cols) == 1:
+                only_col = list(available_cols)[0]
+                modified_prompt = resolved_prompt
+                for missing_col in still_missing:
+                    pattern = r'\{' + re.escape(missing_col) + r'\}'
+                    replacement = '{' + only_col + '}'
+                    modified_prompt = re.sub(pattern, replacement, modified_prompt)
+                logger.warning(
+                    f"{operation_name}: Replaced missing column references {still_missing} "
+                    f"with only available column '{only_col}'"
+                )
+                return modified_prompt
+            
+            raise ValueError(
+                f"Column reference error in {operation_name}: "
+                f"Columns {still_missing} not found in DataFrame. "
+                f"Available columns: {sorted(list(available_cols))}. "
+                f"The prompt contains invalid column references that don't exist in the table. "
+                f"Check for typos, backticks, or incorrect column names."
+            )
+        
+        return prompt
+    
     def sem_where(self, df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
         """Semantic filtering using LOTUS."""
         def _operation():
             df_lotus, column_mapping = self.prepare_dataframe(df)
             updated_prompt = self.update_prompt(user_prompt, column_mapping)
             
+            # Check if we have column placeholders - if not, try to add them intelligently
+            if '{' not in updated_prompt:
+                # Try to detect which columns might be referenced
+                col_candidates = []
+                for col in df_lotus.columns:
+                    # Check if column name appears in prompt (case-insensitive, check original name too)
+                    original_col = column_mapping.get(col, col)
+                    if col.lower() in updated_prompt.lower() or original_col.lower() in updated_prompt.lower():
+                        col_candidates.append(col)
+                
+                if col_candidates:
+                    # Use the first matching column
+                    logger.info(f"Auto-adding column reference {{{col_candidates[0]}}} to SEM_WHERE prompt")
+                    updated_prompt = f"{{{col_candidates[0]}}} {updated_prompt}"
+                else:
+                    # Default to first text column if available
+                    text_cols = [col for col in df_lotus.columns if df_lotus[col].dtype == 'object']
+                    if text_cols:
+                        logger.warning(f"No column references found. Using first text column {{{text_cols[0]}}}")
+                        updated_prompt = f"{{{text_cols[0]}}} {updated_prompt}"
+            
+            # Validate column references before executing
+            updated_prompt = self._validate_column_references(updated_prompt, df_lotus, "SEM_WHERE")
+            
             result_df_lotus = df_lotus.sem_filter(updated_prompt)
             result_df = self.restore_dataframe(result_df_lotus, column_mapping)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns)
             
             logging.info(f"Result of LOTUS SEM_WHERE: {result_df.head(10)}")
             return result_df
         
         try:
             return self._track_operation(_operation)
+        except ValueError as e:
+            # Column reference error - provide clear message
+            error_msg = str(e)
+            if "no parameterized columns" in error_msg.lower():
+                logging.error(f"LOTUS SEM_WHERE error: Prompt must include column references using {{column_name}}. "
+                            f"Prompt: '{user_prompt}'")
+                raise ValueError(f"LOTUS SEM_WHERE error: Prompt must include column references using {{column_name}}. "
+                               f"Prompt: '{user_prompt}'") from e
+            logging.error(f"Column reference error in LOTUS SEM_WHERE: {e}")
+            raise
         except Exception as e:
             logging.error(f"Error during LOTUS SEM_WHERE: {e}")
-            return df
+            raise RuntimeError(f"LOTUS SEM_WHERE execution failed: {str(e)}") from e
     
     def sem_select(self, df: pd.DataFrame, user_prompt: str, alias: str) -> pd.DataFrame:
         """Semantic selection using LOTUS."""
+        # Ensure alias doesn't conflict with existing columns
+        unique_alias = self._ensure_unique_alias(df, alias)
+        
         def _operation():
             df_lotus, column_mapping = self.prepare_dataframe(df)
             updated_prompt = self.update_prompt(user_prompt, column_mapping)
             
-            result_df_lotus = df_lotus.sem_map(updated_prompt, suffix=alias)
+            # Check if we have column placeholders for extraction operations
+            if '{' not in updated_prompt and ('extract' in updated_prompt.lower() or 'get' in updated_prompt.lower()):
+                # Try to detect which columns might be referenced
+                for col in df_lotus.columns:
+                    original_col = column_mapping.get(col, col)
+                    if col.lower() in updated_prompt.lower() or original_col.lower() in updated_prompt.lower():
+                        logger.info(f"Auto-adding column reference {{{col}}} to SEM_SELECT prompt")
+                        updated_prompt = f"Extract from {{{col}}}: {updated_prompt}"
+                        break
+            
+            # Validate column references before executing
+            updated_prompt = self._validate_column_references(updated_prompt, df_lotus, "SEM_SELECT")
+            
+            result_df_lotus = df_lotus.sem_map(updated_prompt, suffix=unique_alias)
             result_df = self.restore_dataframe(result_df_lotus, column_mapping)
 
+            # Validate that the new column was created and has content
+            if unique_alias not in result_df.columns:
+                raise ValueError(
+                    f"SEM_SELECT failed to create column '{unique_alias}'. "
+                    f"Check that prompt is specific and complete. "
+                    f"Example: 'Extract country code from {{column}} as 2-letter code' "
+                    f"instead of just 'Extract'."
+                )
+            
+            # Check if all values are NULL/empty and provide actionable feedback
+            null_count = result_df[unique_alias].isna().sum()
+            total_count = len(result_df)
+            if null_count == total_count and total_count > 0:
+                logger.warning(
+                    f"SEM_SELECT column '{unique_alias}' contains only NULL values ({total_count}/{total_count}). "
+                    f"This likely means the extraction prompt is unclear or too restrictive. "
+                    f"Prompt was: {updated_prompt[:100]}... "
+                    f"Suggestion: Be more specific about what to extract and the expected format."
+                )
+            elif null_count > total_count * 0.5:
+                logger.warning(
+                    f"SEM_SELECT column '{unique_alias}' has {null_count}/{total_count} NULL values. "
+                    f"Many rows failed extraction. Consider simplifying the prompt or checking data format."
+                )
+
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns.tolist() + [unique_alias])
+            
             logging.info(f"Result of LOTUS SEM_SELECT: {result_df.head(10)}")
             return result_df
         
@@ -157,6 +354,11 @@ class LOTUSBackend(BaseBackend):
         
         def _operation():
             result_df = df.sem_index(column, f"{column.replace(' ', '_')}_index").sem_cluster_by(column, number_of_groups)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns)
+            
             logging.info(f"Result of LOTUS SEM_GROUP_BY: {result_df.head(10)}")
             return result_df
         
@@ -174,6 +376,12 @@ class LOTUSBackend(BaseBackend):
                 result_df = df.sem_agg(user_prompt, suffix=alias, group_by=group_by_col)
             else:
                 result_df = df.sem_agg(user_prompt, suffix=alias)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                expected_cols = group_by_col if group_by_col else []
+                result_df = pd.DataFrame(columns=expected_cols + [alias])
+            
             logging.info(f"Result of LOTUS SEM_AGG: {result_df.head(10)}")
             return result_df
         
@@ -187,6 +395,11 @@ class LOTUSBackend(BaseBackend):
         """Semantic deduplication using LOTUS."""
         def _operation():
             result_df = df.sem_index(f"{column}", f"{column}_index").sem_dedup(f"{column}", threshold=LOTUS_DEFAULT_DEDUP_THRESHOLD)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns)
+            
             logging.info(f"Result of LOTUS SEM_DISTINCT: {result_df.head(10)}")
             return result_df
         
@@ -204,6 +417,11 @@ class LOTUSBackend(BaseBackend):
                 logging.info("DataFrame is empty, returning original DataFrame.")
                 return df
             result_df = df.sem_topk(user_prompt, K=number_of_records, return_stats=False)
+            
+            # Ensure columns are preserved even when empty
+            if result_df.empty and not df.empty:
+                result_df = pd.DataFrame(columns=df.columns)
+            
             logging.info(f"Result of LOTUS SEM_ORDER_BY: {result_df.head(10)}")
             return result_df
         
