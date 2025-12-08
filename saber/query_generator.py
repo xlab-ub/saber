@@ -304,7 +304,16 @@ Guidelines:
 - ALWAYS include FROM clause with actual table name(s)
 - CRITICAL: Ensure semantic functions reference valid columns from the schema - check spelling and capitalization
 - CRITICAL: Never use backticks, quotes, or other punctuation around column names in semantic function prompts
+- CRITICAL: For COUNT queries, prefer simple COUNT(*) with WHERE conditions over complex semantic aggregations
+- CRITICAL: Validate column names in WHERE/SELECT match exact schema column names (case-sensitive)
 - {db_constraints}
+
+Query Correctness Checklist:
+1. Do all column names in query exist in schema? Check spelling/case
+2. Can question be answered with structured columns alone? Use SQL operations first
+3. Are semantic functions necessary? Only use when text analysis required
+4. For aggregations (COUNT/SUM/MAX), ensure proper GROUP BY clause
+5. Does query logic match question intent? Verify filtering/sorting/grouping
 
 CRITICAL Semantic Function Principles:
 
@@ -572,6 +581,22 @@ Semantic Functions:
             )
         return ""
     
+    def _extract_columns_from_schema(self, schema: str) -> Dict[str, List[str]]:
+        """Extract table names and column names from schema for validation."""
+        import re
+        table_columns = {}
+        
+        # Pattern: Table: table_name followed by Columns: col1, col2, ...
+        table_pattern = r'Table:\s+(\w+)\s+Columns:\s+([^\n]+)'
+        matches = re.findall(table_pattern, schema)
+        
+        for table_name, columns_str in matches:
+            # Parse column names (format: "col1 (type), col2 (type), ...")
+            columns = [col.split('(')[0].strip() for col in columns_str.split(',')]
+            table_columns[table_name] = columns
+        
+        return table_columns
+    
     def generate(
         self, 
         question: str,
@@ -622,6 +647,9 @@ Semantic Functions:
         
         if not schema:
             raise ValueError("Must provide either 'schema' string or 'df' dictionary with 'tables' list")
+        
+        # Extract available columns for validation
+        self._schema_columns = self._extract_columns_from_schema(schema)
         
         # Use backend-specific examples if none provided
         if examples is None:
@@ -1431,6 +1459,29 @@ LIMIT 10
                      # This is a loose check, might false positive on SQL keywords, but it's just a warning/check
                      pass
         
+        # ===== STAGE 4.5: Column Reference Validation =====
+        
+        # Validate column names in WHERE, SELECT, GROUP BY, ORDER BY
+        if hasattr(self, '_schema_columns') and self._schema_columns:
+            available_cols = set()
+            for table_cols in self._schema_columns.values():
+                available_cols.update(table_cols)
+            
+            # Extract column references from non-semantic SQL parts
+            # This is a heuristic check - not perfect but catches common errors
+            
+            # Check WHERE clause columns (excluding semantic functions)
+            where_match = re.search(r'WHERE\s+([^;]+?)(?:GROUP BY|ORDER BY|LIMIT|$)', query, re.IGNORECASE)
+            if where_match:
+                where_clause = where_match.group(1)
+                # Remove semantic function calls
+                where_cleaned = re.sub(r'SEM_\w+\s*\([^)]+\)', '', where_clause, flags=re.IGNORECASE)
+                # Extract potential column names (word before =, <, >, IN, etc.)
+                potential_cols = re.findall(r'\b([a-zA-Z_][\w]*)\s*(?:=|<|>|<=|>=|!=|<>|IN|LIKE)', where_cleaned, re.IGNORECASE)
+                for col in potential_cols:
+                    if col.upper() not in ['AND', 'OR', 'NOT', 'NULL', 'TRUE', 'FALSE'] and col not in available_cols and f'`{col}`' not in available_cols:
+                        logger.warning(f"Column '{col}' in WHERE clause not found in schema. Available: {list(available_cols)}")
+        
         # ===== STAGE 5: Semantic Function Validation =====
         
         semantic_funcs = ['SEM_WHERE', 'SEM_SELECT', 'SEM_AGG', 'SEM_ORDER_BY', 'SEM_GROUP_BY', 'SEM_JOIN']
@@ -1446,6 +1497,20 @@ LIMIT 10
                     # Check backend parameter (unified mode doesn't require it)
                     if backend != 'unified' and f"'{backend}'" not in func_call and f'"{backend}"' not in func_call:
                         return f"{func} call missing or incorrect backend parameter: expected '{backend}'"
+                    
+                    # Validate column references in semantic functions
+                    if backend == 'lotus' and hasattr(self, '_schema_columns') and self._schema_columns:
+                        # Extract {column} references
+                        col_refs = re.findall(r'\{([\w.]+)\}', func_call)
+                        available_cols = set()
+                        for table_cols in self._schema_columns.values():
+                            available_cols.update(table_cols)
+                        
+                        for col_ref in col_refs:
+                            # Handle table.column syntax
+                            col_name = col_ref.split('.')[-1] if '.' in col_ref else col_ref
+                            if col_name not in available_cols:
+                                return f"{func} references non-existent column '{col_name}'. Available columns: {', '.join(sorted(available_cols)[:10])}"
                     
                     # Count arguments (commas outside of quotes)
                     in_quotes = False

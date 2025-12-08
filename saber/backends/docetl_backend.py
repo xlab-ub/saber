@@ -4,6 +4,7 @@ DocETL backend implementation for SABER semantic operations.
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import json
 import yaml
@@ -72,10 +73,32 @@ class DocETLBackend(BaseBackend):
         return df_restored
     
     def update_prompt(self, prompt: str, column_mapping: Dict[str, str]) -> str:
-        """Update prompts to use underscore column names for DocETL."""
+        """Update prompts to use underscore column names for DocETL.
+        
+        Also handles table alias prefixes (e.g., {{ input.d.biography }} -> {{ input.biography }})
+        """
         updated_prompt = prompt
         
-        # Replace dot notation with underscore notation in DocETL templates
+        # First, handle table alias prefixes in DocETL Jinja2 templates
+        # Pattern matches {{ input.alias.column }} and converts to {{ input.column }}
+        alias_pattern = r'\{\{\s*input\.([a-zA-Z_]\w*)\.([a-zA-Z_][\w]*)\s*\}\}'
+        def replace_docetl_alias(match):
+            # Extract just the column part, ignoring the alias
+            return '{{ input.' + match.group(2) + ' }}'
+        updated_prompt = re.sub(alias_pattern, replace_docetl_alias, updated_prompt)
+        
+        # Also handle {{ left.alias.column }} and {{ right.alias.column }} for joins
+        left_alias_pattern = r'\{\{\s*left\.([a-zA-Z_]\w*)\.([a-zA-Z_][\w]*)\s*\}\}'
+        def replace_left_alias(match):
+            return '{{ left.' + match.group(2) + ' }}'
+        updated_prompt = re.sub(left_alias_pattern, replace_left_alias, updated_prompt)
+        
+        right_alias_pattern = r'\{\{\s*right\.([a-zA-Z_]\w*)\.([a-zA-Z_][\w]*)\s*\}\}'
+        def replace_right_alias(match):
+            return '{{ right.' + match.group(2) + ' }}'
+        updated_prompt = re.sub(right_alias_pattern, replace_right_alias, updated_prompt)
+        
+        # Then replace dot notation with underscore notation in DocETL templates
         for underscore_col, original_col in column_mapping.items():
             # Replace {{ input.original.col }} with {{ input.underscore_col }}
             pattern = r'\{\{\s*input\.' + re.escape(original_col) + r'\s*\}\}'
@@ -379,6 +402,7 @@ Return only the selected {column} value, nothing else.""",
                 # Create DocETL pipeline YAML
                 pipeline_file = temp_path / "docetl_pipeline.yaml"
                 output_file = temp_path / "docetl_output.json"
+                api_call_count_file = temp_path / "api_call_count.txt"
                 
                 pipeline_config = {
                     'datasets': datasets,
@@ -393,8 +417,60 @@ Return only the selected {column} value, nothing else.""",
                 with open(pipeline_file, 'w') as f:
                     yaml.dump(pipeline_config, f, default_flow_style=False, indent=2)
                 
-                # Run DocETL via subprocess with API key in environment
-                cmd = ['docetl', 'run', str(pipeline_file)]
+                # Create wrapper script to inject litellm callbacks for API call counting
+                wrapper_script = temp_path / "docetl_wrapper.py"
+                with open(wrapper_script, 'w') as f:
+                    f.write(f'''#!/usr/bin/env python3
+import sys
+import threading
+
+# CRITICAL: Register callbacks BEFORE importing docetl to ensure they capture all API calls
+import litellm
+
+# Global API call counter
+_api_call_count = 0
+_api_call_lock = threading.Lock()
+
+def _success_callback(kwargs, completion_response, start_time, end_time):
+    global _api_call_count
+    with _api_call_lock:
+        _api_call_count += 1
+
+def _failure_callback(kwargs, completion_response, start_time, end_time):
+    global _api_call_count
+    with _api_call_lock:
+        _api_call_count += 1
+
+# Initialize callback lists if needed
+if not hasattr(litellm, 'success_callback') or litellm.success_callback is None:
+    litellm.success_callback = []
+elif not isinstance(litellm.success_callback, list):
+    litellm.success_callback = [litellm.success_callback]
+
+if not hasattr(litellm, 'failure_callback') or litellm.failure_callback is None:
+    litellm.failure_callback = []
+elif not isinstance(litellm.failure_callback, list):
+    litellm.failure_callback = [litellm.failure_callback]
+
+# Register callbacks
+litellm.success_callback.append(_success_callback)
+litellm.failure_callback.append(_failure_callback)
+
+# NOW import DocETL after callbacks are registered
+from docetl.cli import app
+
+# Run DocETL CLI
+if __name__ == '__main__':
+    try:
+        app()
+    finally:
+        # Write API call count to file
+        with open(r"{str(api_call_count_file)}", "w") as f:
+            f.write(str(_api_call_count))
+''')
+                
+                # Run wrapper script instead of docetl directly
+                cmd = [sys.executable, str(wrapper_script), 'run', str(pipeline_file)]
                 env = os.environ.copy()
                 
                 # Only set OPENAI_API_KEY if we have a valid key (not "dummy")
@@ -407,10 +483,25 @@ Return only the selected {column} value, nothing else.""",
                 
                 result = subprocess.run(cmd, cwd=temp_dir, capture_output=True, text=True, timeout=300, env=env)
                 
-                # Extract stats from output
+                # Extract stats from output (including API call count from file)
+                # Must do this BEFORE temp_dir is cleaned up
                 combined_output = result.stdout + result.stderr
+                # Log wrapper debug messages
+                for line in result.stderr.split('\n'):
+                    if 'WRAPPER' in line or 'CALLBACK' in line:
+                        logging.debug(f"Wrapper: {line}")
                 # logger.info(f"DocETL output:\n{combined_output}")
-                self.last_stats = extract_docetl_stats(combined_output)
+                
+                # Check if count file exists and log for debugging
+                if api_call_count_file.exists():
+                    with open(api_call_count_file, 'r') as f:
+                        count_content = f.read().strip()
+                        logging.debug(f"API call count file exists with content: {count_content}")
+                else:
+                    logging.debug(f"API call count file does not exist: {api_call_count_file}")
+                
+                self.last_stats = extract_docetl_stats(combined_output, api_call_count_file=str(api_call_count_file))
+                logging.debug(f"DocETL last_stats after extract: api_calls={self.last_stats.api_calls}, cost=${self.last_stats.total_cost}")
                 
                 if result.returncode != 0:
                     logging.error(f"DocETL {operation_type} command failed with return code {result.returncode}")

@@ -217,13 +217,24 @@ class SemRewriter:
                     if col.name not in self._semantic_columns:
                         needed.add(col.name)
         
-        # Add columns referenced in semantic operations (via {column_name} placeholders)
+        # Add columns referenced in semantic operations (via {column_name} or {alias.column} placeholders)
         for op in self.pending.operations:
             for arg in op.args:
-                # Extract column names from {column_name} patterns in prompts
-                matches = re.findall(r'\{(\w+)\}', arg)
+                # Extract column names from {column_name} or {alias.column} patterns in prompts
+                # Pattern matches: {column}, {alias.column}, {column:left}, {column:right}
+                matches = re.findall(r'\{([^}]+)\}', arg)
                 for match in matches:
-                    needed.add(match)
+                    # Strip whitespace and handle different formats
+                    clean_match = match.strip()
+                    # Remove :left or :right suffix if present (for JOIN operations)
+                    if ':' in clean_match:
+                        clean_match = clean_match.split(':')[0].strip()
+                    # If it's alias.column format, extract the column part
+                    if '.' in clean_match:
+                        column_name = clean_match.split('.')[-1].strip()
+                        needed.add(column_name)
+                    else:
+                        needed.add(clean_match)
         
         return needed if needed else {'*'}
     
@@ -633,10 +644,25 @@ class SemRewriter:
             # because SEM_AGG with group_by already produces aggregated results
             has_semantic_agg = any(op.op_type == 'agg' for op in self.pending.operations)
             
+            # Check if SELECT has traditional aggregation functions (AVG, COUNT, SUM, etc.)
+            select = root.find(exp.Select)
+            has_traditional_agg = False
+            if select:
+                for expr in select.expressions:
+                    # Check for aggregate functions like AVG, COUNT, SUM, MAX, MIN
+                    if expr.find(exp.AggFunc):
+                        has_traditional_agg = True
+                        break
+            
             if has_semantic_group and not has_semantic_agg:
-                # Only add GROUP BY if there's no aggregation
-                # (aggregation handles grouping internally)
-                final_query += " GROUP BY cluster_id"
+                if has_traditional_agg:
+                    # Query uses traditional aggregation (AVG, COUNT, etc.) with SEM_GROUP_BY
+                    # Need GROUP BY cluster_id for proper SQL aggregation
+                    final_query += " GROUP BY cluster_id"
+                else:
+                    # No aggregation - just adds cluster_id column, no SQL GROUP BY needed
+                    # Adding GROUP BY would cause "column must appear in GROUP BY" errors with SELECT *
+                    pass
             elif not has_semantic_group:
                 # Traditional GROUP BY (no semantic operations)
                 # But check if any GROUP BY expression matches a semantic SELECT that's been processed
@@ -667,14 +693,18 @@ class SemRewriter:
                         matched_alias = self._sem_expr_to_alias[expr_sql]
                         group_by_exprs.append(matched_alias)
                     else:
-                        group_by_exprs.append(expr_sql)
+                        # Strip table aliases from GROUP BY expressions
+                        group_by_exprs.append(self._strip_table_aliases(expr_sql))
                 
                 final_query += f" GROUP BY {', '.join(group_by_exprs)}"
         
         # Preserve HAVING clause
         having_clause = root.find(exp.Having)
         if having_clause:
-            final_query += f" HAVING {having_clause.this.sql(dialect=self.dialect)}"
+            having_sql = having_clause.this.sql(dialect=self.dialect)
+            # Strip table aliases from HAVING clause
+            having_sql = self._strip_table_aliases(having_sql)
+            final_query += f" HAVING {having_sql}"
         
         # Preserve traditional ORDER BY (non-semantic ordering)
         order_clause = root.find(exp.Order)
@@ -689,6 +719,8 @@ class SemRewriter:
             
             if not has_semantic_order:
                 order_by_sql = order_clause.sql(dialect=self.dialect).replace('ORDER BY', '').strip()
+                # Strip table aliases from ORDER BY clause
+                order_by_sql = self._strip_table_aliases(order_by_sql)
                 final_query += f" ORDER BY {order_by_sql}"
         
         # Preserve LIMIT
@@ -781,6 +813,22 @@ class SemRewriter:
                 projections.append(expr.sql(dialect=self.dialect))
         return ', '.join(projections) if projections else '*'
     
+    def _strip_table_aliases(self, sql_fragment: str) -> str:
+        """Strip table alias prefixes from column references in SQL fragment.
+        
+        Converts: m.title, d.name -> title, name
+        Preserves: function calls, literals, operators
+        """
+        # Pattern to match table_alias.column_name
+        # Match word boundaries to avoid partial matches
+        pattern = r'\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b'
+        
+        def replace_match(match):
+            # Just return the column name without the table prefix
+            return match.group(2)
+        
+        return re.sub(pattern, replace_match, sql_fragment)
+    
     def _extract_final_projection(self, root: exp.Expression) -> str:
         select = root.find(exp.Select)
         if not select:
@@ -796,12 +844,20 @@ class SemRewriter:
                     # just reference the alias name directly in the final projection
                     projections.append(expr.alias)
                 else:
-                    projections.append(f"{expr.this.sql(dialect=self.dialect)} AS {expr.alias}")
+                    # For non-semantic aliases, strip table prefix from column references
+                    # since after JOIN flattening, columns don't have table prefixes
+                    inner_expr = expr.this
+                    if isinstance(inner_expr, exp.Column):
+                        # Strip table prefix: m.title -> title
+                        col_name = inner_expr.name if hasattr(inner_expr, 'name') else str(inner_expr)
+                        projections.append(f"{col_name} AS {expr.alias}")
+                    else:
+                        projections.append(f"{inner_expr.sql(dialect=self.dialect)} AS {expr.alias}")
             elif isinstance(expr, exp.Column):
-                # Check if this is a reference to a semantic column
-                # This handles cases where a semantic column is referenced in SELECT
-                # after being created by SEM_SELECT
-                projections.append(expr.sql(dialect=self.dialect))
+                # Strip table prefix from column references
+                # After JOIN and semantic operations, columns are flattened without table prefixes
+                col_name = expr.name if hasattr(expr, 'name') else str(expr)
+                projections.append(col_name)
             else:
                 projections.append(expr.sql(dialect=self.dialect))
         

@@ -3,10 +3,14 @@ Palimpzest backend implementation for SABER semantic operations.
 """
 import re
 import os
+import time
+import threading
 from contextlib import contextmanager
 from typing import Dict, Optional, List
 import logging
 import pandas as pd
+import traceback
+import litellm
 
 import palimpzest as pz
 from palimpzest.core.elements.groupbysig import GroupBySig
@@ -75,6 +79,98 @@ class PalimpzestBackend(BaseBackend):
         if self.embedding_model is None:
             from ..config import PALIMPZEST_DEFAULT_EMBEDDING_MODEL
             self.embedding_model = PALIMPZEST_DEFAULT_EMBEDDING_MODEL
+        self._api_call_count = 0
+        self._embedding_call_count = 0
+        self._api_call_lock = threading.Lock()
+        self._register_callbacks()
+    
+    def _register_callbacks(self):
+        """Register litellm callbacks for API call counting."""
+        # Initialize callback lists if they don't exist or are not lists
+        if not hasattr(litellm, 'success_callback'):
+            litellm.success_callback = []
+        elif litellm.success_callback is None:
+            litellm.success_callback = []
+        elif not isinstance(litellm.success_callback, list):
+            litellm.success_callback = [litellm.success_callback]
+            
+        if not hasattr(litellm, 'failure_callback'):
+            litellm.failure_callback = []
+        elif litellm.failure_callback is None:
+            litellm.failure_callback = []
+        elif not isinstance(litellm.failure_callback, list):
+            litellm.failure_callback = [litellm.failure_callback]
+        
+        # Append callbacks if not already registered (idempotent)
+        if self._success_callback not in litellm.success_callback:
+            litellm.success_callback.append(self._success_callback)
+        if self._failure_callback not in litellm.failure_callback:
+            litellm.failure_callback.append(self._failure_callback)
+    
+    def _success_callback(self, kwargs, completion_response, start_time, end_time):
+        """Callback for successful API calls."""
+        with self._api_call_lock:
+            call_type = kwargs.get('call_type', '')
+            if call_type in ('embedding', 'aembedding'):
+                self._embedding_call_count += 1
+            else:
+                self._api_call_count += 1
+    
+    def _failure_callback(self, kwargs, completion_response, start_time, end_time):
+        """Callback for failed API calls."""
+        with self._api_call_lock:
+            call_type = kwargs.get('call_type', '')
+            if call_type in ('embedding', 'aembedding'):
+                self._embedding_call_count += 1
+            else:
+                self._api_call_count += 1
+    
+    def _reset_api_call_count(self):
+        """Reset API call counter."""
+        with self._api_call_lock:
+            self._api_call_count = 0
+            self._embedding_call_count = 0
+    
+    def _get_api_call_count(self) -> int:
+        """Get current API call count.
+        
+        Includes a small delay to ensure litellm async callbacks complete
+        before reading the counter.
+        """
+        import time
+        time.sleep(0.01)  # 10ms to flush callback queue
+        with self._api_call_lock:
+            return self._api_call_count
+    
+    def _get_embedding_call_count(self) -> int:
+        """Get current embedding call count.
+        
+        Includes a small delay to ensure litellm async callbacks complete
+        before reading the counter.
+        """
+        import time
+        time.sleep(0.01)  # 10ms to flush callback queue
+        with self._api_call_lock:
+            return self._embedding_call_count
+    
+    def _wrap_embedding_function(self, ef):
+        """Wrap ChromaDB embedding function to track calls."""
+        if ef is None or hasattr(ef, '_tracking_wrapped'):
+            return ef
+        
+        if hasattr(ef, '__call__'):
+            original_call = ef.__call__
+            backend = self
+            
+            def tracked_call(input):
+                with backend._api_call_lock:
+                    backend._embedding_call_count += 1
+                return original_call(input)
+            
+            ef.__call__ = tracked_call
+            ef._tracking_wrapped = True
+        
+        return ef
     
     def __del__(self):
         """Cleanup when destroyed."""
@@ -258,6 +354,7 @@ class PalimpzestBackend(BaseBackend):
     def sem_where(self, df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
         """Semantic filtering using Palimpzest."""
         try:
+            self._reset_api_call_count()
             df_palimpzest, column_mapping = self.prepare_dataframe(df)
 
             # Use temporary environment variable for API key
@@ -291,6 +388,9 @@ class PalimpzestBackend(BaseBackend):
             if result_df.empty and not df.empty:
                 result_df = pd.DataFrame(columns=df.columns)
 
+            self.last_stats.api_calls = self._get_api_call_count()
+            self.last_stats.embedding_calls = self._get_embedding_call_count()
+            logging.info(f"Result of Palimpzest SEM_SELECT: {result_df.head(10)}")
             logging.info(f"Result of Palimpzest SEM_WHERE: {result_df.head(10)}")
             return result_df
         except Exception as e:
@@ -304,6 +404,7 @@ class PalimpzestBackend(BaseBackend):
         # Ensure alias doesn't conflict with existing columns
         unique_alias = self._ensure_unique_alias(df, alias)
         try:
+            self._reset_api_call_count()
             df_palimpzest, column_mapping = self.prepare_dataframe(df)
 
             # Use temporary environment variable for API key
@@ -338,6 +439,7 @@ class PalimpzestBackend(BaseBackend):
             if result_df.empty and not df.empty:
                 result_df = pd.DataFrame(columns=df.columns.tolist() + [unique_alias])
 
+            self.last_stats.api_calls = self._get_api_call_count()
             logging.info(f"Result of Palimpzest SEM_SELECT: {result_df.head(10)}")
             return result_df
         except Exception as e:
@@ -364,6 +466,7 @@ class PalimpzestBackend(BaseBackend):
         if not hasattr(pz, 'MemoryDataset'):
             raise NotImplementedError("Palimpzest does not support semantic join operation directly.")
         try:
+            self._reset_api_call_count()
             df1_palimpzest, df1_column_mapping = self.prepare_dataframe(df1)
             df2_palimpzest, df2_column_mapping = self.prepare_dataframe(df2)
             column_mapping = {**df1_column_mapping, **df2_column_mapping}
@@ -387,6 +490,8 @@ class PalimpzestBackend(BaseBackend):
             if not result_df.empty and column_mapping:
                 result_df = self.restore_dataframe(result_df, column_mapping)
 
+            self.last_stats.api_calls = self._get_api_call_count()
+            self.last_stats.embedding_calls = self._get_embedding_call_count()
             logging.info(f"Result of Palimpzest SEM_JOIN: {result_df.head(10)}")
             return result_df
         except Exception as e:
@@ -463,6 +568,7 @@ class PalimpzestBackend(BaseBackend):
             return {relevant_col_name: final_results}
         
         try:
+            self._reset_api_call_count()
             relevant_columns = [
                 {"name": relevant_col_name, "type": list[str], "desc": f"Relevant {specified_column} based on {user_prompt}"}
             ]
@@ -490,6 +596,9 @@ class PalimpzestBackend(BaseBackend):
                     api_key=self.api_key,
                     model_name=self.embedding_model
                 )
+            
+            embedding_function = self._wrap_embedding_function(embedding_function)
+            
             with temporary_env_vars(env_vars):
                 index = self.chroma_client.create_collection(
                     name="palimpzest_collection", 
@@ -570,6 +679,8 @@ class PalimpzestBackend(BaseBackend):
                 # Sort by the new '_relevant' column
                 result_df = result_df.sort_values(by=['_relevant']).reset_index(drop=True)
 
+            self.last_stats.api_calls = self._get_api_call_count()
+            self.last_stats.embedding_calls = self._get_embedding_call_count()
             logging.info(f"Result of Palimpzest SEM_ORDER_BY: {result_df.head(10)}")
             return result_df
         except Exception as e:

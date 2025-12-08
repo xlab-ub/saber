@@ -1,11 +1,15 @@
 """
 LOTUS backend implementation for SABER semantic operations.
 """
+import os
 import re
 import time
+import threading
+import shutil
 from typing import Dict, Optional, List
 import logging
 import pandas as pd
+import litellm
 
 from .base_backend import BaseBackend
 from ..config import LOTUS_DEFAULT_DEDUP_THRESHOLD
@@ -20,15 +24,142 @@ class LOTUSBackend(BaseBackend):
         super().__init__("LOTUS", api_key, model, api_base, embedding_model, embedding_api_base)
         self.last_stats = BenchmarkStats()
         self._lm = None  # Will be set by engine
+        self._api_call_count = 0
+        self._embedding_call_count = 0
+        self._api_call_lock = threading.Lock()
+        self._register_callbacks()
+        self._rm_wrapped = False
+    
+    def _register_callbacks(self):
+        """Register litellm callbacks for API call counting."""
+        # Initialize callback lists if they don't exist or are not lists
+        if not hasattr(litellm, 'success_callback'):
+            litellm.success_callback = []
+        elif litellm.success_callback is None:
+            litellm.success_callback = []
+        elif not isinstance(litellm.success_callback, list):
+            litellm.success_callback = [litellm.success_callback]
+            
+        if not hasattr(litellm, 'failure_callback'):
+            litellm.failure_callback = []
+        elif litellm.failure_callback is None:
+            litellm.failure_callback = []
+        elif not isinstance(litellm.failure_callback, list):
+            litellm.failure_callback = [litellm.failure_callback]
+        
+        # Append callbacks if not already registered (idempotent)
+        if self._success_callback not in litellm.success_callback:
+            litellm.success_callback.append(self._success_callback)
+        if self._failure_callback not in litellm.failure_callback:
+            litellm.failure_callback.append(self._failure_callback)
+    
+    def _success_callback(self, kwargs, completion_response, start_time, end_time):
+        """Callback for successful API calls."""
+        with self._api_call_lock:
+            call_type = kwargs.get('call_type', '')
+            if call_type in ('embedding', 'aembedding'):
+                self._embedding_call_count += 1
+            else:
+                self._api_call_count += 1
+    
+    def _failure_callback(self, kwargs, completion_response, start_time, end_time):
+        """Callback for failed API calls."""
+        with self._api_call_lock:
+            call_type = kwargs.get('call_type', '')
+            if call_type in ('embedding', 'aembedding'):
+                self._embedding_call_count += 1
+            else:
+                self._api_call_count += 1
+    
+    def _reset_api_call_count(self):
+        """Reset API call counter."""
+        with self._api_call_lock:
+            self._api_call_count = 0
+            self._embedding_call_count = 0
+    
+    def _get_api_call_count(self) -> int:
+        """Get current API call count.
+        
+        Includes a small delay to ensure litellm async callbacks complete
+        before reading the counter.
+        """
+        import time
+        time.sleep(0.01)  # 10ms to flush callback queue
+        with self._api_call_lock:
+            return self._api_call_count
+    
+    def _get_embedding_call_count(self) -> int:
+        """Get current embedding call count.
+        
+        Includes a small delay to ensure litellm async callbacks complete
+        before reading the counter.
+        """
+        import time
+        time.sleep(0.01)  # 10ms to flush callback queue
+        with self._api_call_lock:
+            return self._embedding_call_count
+    
+    def _wrap_rm_for_tracking(self):
+        """Wrap the retrieval model to track embedding calls."""
+        import lotus
+        from lotus.models import SentenceTransformersRM, LiteLLMRM
+        
+        if self._rm_wrapped or not hasattr(lotus.settings, 'rm') or lotus.settings.rm is None:
+            return
+        
+        rm = lotus.settings.rm
+        
+        # For LiteLLMRM, callbacks already handle tracking
+        # For SentenceTransformersRM, we need to wrap the call
+        if isinstance(rm, SentenceTransformersRM):
+            original_call = rm.__call__
+            backend = self
+            
+            def tracked_call(docs):
+                with backend._api_call_lock:
+                    backend._embedding_call_count += 1
+                return original_call(docs)
+            
+            rm.__call__ = tracked_call
+            self._rm_wrapped = True
+        elif isinstance(rm, LiteLLMRM):
+            # LiteLLMRM uses litellm callbacks, already tracked
+            self._rm_wrapped = True
     
     def _track_operation(self, operation_func, *args, **kwargs):
         """Track cost and latency for a LOTUS operation."""
-        if self._lm is None:
-            # If LM is not set, just run the operation without tracking
-            return operation_func(*args, **kwargs)
+        # Wrap RM for tracking even if _lm is None (for embedding-only operations)
+        if not self._rm_wrapped:
+            self._wrap_rm_for_tracking()
         
-        # Reset LM stats before operation
+        if self._lm is None:
+            # If LM is not set, track embeddings only
+            self._reset_api_call_count()
+            start_time = time.time()
+            
+            try:
+                result = operation_func(*args, **kwargs)
+                elapsed_time = time.time() - start_time
+                
+                self.last_stats = BenchmarkStats(
+                    total_semantic_execution_time_seconds=elapsed_time,
+                    api_calls=self._get_api_call_count(),
+                    embedding_calls=self._get_embedding_call_count()
+                )
+                
+                return result
+            except Exception as e:
+                elapsed_time = time.time() - start_time
+                self.last_stats = BenchmarkStats(
+                    total_semantic_execution_time_seconds=elapsed_time,
+                    api_calls=self._get_api_call_count(),
+                    embedding_calls=self._get_embedding_call_count()
+                )
+                raise
+        
+        # Reset LM stats and API counter before operation
         self._lm.reset_stats()
+        self._reset_api_call_count()
         start_time = time.time()
         
         try:
@@ -38,12 +169,16 @@ class LOTUSBackend(BaseBackend):
             # Extract stats from LM
             self.last_stats = extract_lotus_stats(self._lm)
             self.last_stats.total_semantic_execution_time_seconds = elapsed_time
+            self.last_stats.api_calls = self._get_api_call_count()
+            self.last_stats.embedding_calls = self._get_embedding_call_count()
             
             return result
         except Exception as e:
             elapsed_time = time.time() - start_time
             self.last_stats = BenchmarkStats(
-                total_semantic_execution_time_seconds=elapsed_time
+                total_semantic_execution_time_seconds=elapsed_time,
+                api_calls=self._get_api_call_count(),
+                embedding_calls=self._get_embedding_call_count()
             )
             raise
     
@@ -78,10 +213,21 @@ class LOTUSBackend(BaseBackend):
         return df_restored
     
     def update_prompt(self, prompt: str, column_mapping: Dict[str, str]) -> str:
-        """Update prompts to use underscore column names for LOTUS."""
+        """Update prompts to use underscore column names for LOTUS.
+        
+        Also handles table alias prefixes (e.g., {d.biography} -> {biography})
+        """
         updated_prompt = prompt
         
-        # Replace dot notation with underscore notation in prompts
+        # First, handle table alias prefixes in column references
+        # Pattern matches {alias.column} or {alias.column_name}
+        alias_pattern = r'\{([a-zA-Z_]\w*)\.([a-zA-Z_][\w]*)\}'
+        def replace_alias(match):
+            # Extract just the column part, ignoring the alias
+            return '{' + match.group(2) + '}'
+        updated_prompt = re.sub(alias_pattern, replace_alias, updated_prompt)
+        
+        # Then replace dot notation with underscore notation in prompts
         for underscore_col, original_col in column_mapping.items():
             # Replace {original.col} with {underscore_col}
             pattern = r'\{' + re.escape(original_col) + r'\}'
@@ -352,8 +498,14 @@ class LOTUSBackend(BaseBackend):
         logging.info(f"Grouping by {column} into {number_of_groups} groups using LOTUS.")
         logging.info(f"Original DataFrame:\n{df.head(10)}")
         
+        # Clean up any existing index directory to avoid stale data
+        index_name = f"{column.replace(' ', '_')}_index"
+        if os.path.exists(index_name):
+            shutil.rmtree(index_name)
+            logging.info(f"Cleaned up existing index directory: {index_name}")
+        
         def _operation():
-            result_df = df.sem_index(column, f"{column.replace(' ', '_')}_index").sem_cluster_by(column, number_of_groups)
+            result_df = df.sem_index(column, index_name).sem_cluster_by(column, number_of_groups)
             
             # Ensure columns are preserved even when empty
             if result_df.empty and not df.empty:
@@ -363,9 +515,19 @@ class LOTUSBackend(BaseBackend):
             return result_df
         
         try:
-            return self._track_operation(_operation)
+            result = self._track_operation(_operation)
+            
+            # Clean up index directory after operation
+            if os.path.exists(index_name):
+                shutil.rmtree(index_name)
+                logging.info(f"Cleaned up index directory after operation: {index_name}")
+            
+            return result
         except Exception as e:
             logging.error(f"Error during LOTUS SEM_GROUP_BY: {e}")
+            # Clean up on error too
+            if os.path.exists(index_name):
+                shutil.rmtree(index_name)
             return df
     
     def sem_agg(self, df: pd.DataFrame, user_prompt: str, alias: str,
@@ -393,8 +555,14 @@ class LOTUSBackend(BaseBackend):
     
     def sem_distinct(self, df: pd.DataFrame, column: str) -> pd.DataFrame:
         """Semantic deduplication using LOTUS."""
+        # Clean up any existing index directory to avoid stale data
+        index_name = f"{column}_index"
+        if os.path.exists(index_name):
+            shutil.rmtree(index_name)
+            logging.info(f"Cleaned up existing index directory: {index_name}")
+        
         def _operation():
-            result_df = df.sem_index(f"{column}", f"{column}_index").sem_dedup(f"{column}", threshold=LOTUS_DEFAULT_DEDUP_THRESHOLD)
+            result_df = df.sem_index(f"{column}", index_name).sem_dedup(f"{column}", threshold=LOTUS_DEFAULT_DEDUP_THRESHOLD)
             
             # Ensure columns are preserved even when empty
             if result_df.empty and not df.empty:
@@ -404,9 +572,19 @@ class LOTUSBackend(BaseBackend):
             return result_df
         
         try:
-            return self._track_operation(_operation)
+            result = self._track_operation(_operation)
+            
+            # Clean up index directory after operation
+            if os.path.exists(index_name):
+                shutil.rmtree(index_name)
+                logging.info(f"Cleaned up index directory after operation: {index_name}")
+            
+            return result
         except Exception as e:
             logging.error(f"Error during LOTUS SEM_DISTINCT: {e}")
+            # Clean up on error too
+            if os.path.exists(index_name):
+                shutil.rmtree(index_name)
             return df
     
     def sem_order_by(self, df: pd.DataFrame, user_prompt: str, column: Optional[str] = None) -> pd.DataFrame:

@@ -146,16 +146,22 @@ class SaberEngine:
         self._accumulated_latency = 0.0
         self._accumulated_sql_time = 0.0
         self._accumulated_rewriting_time = 0.0
+        self._accumulated_api_calls = 0
+        self._accumulated_embedding_calls = 0
     
     def _accumulate_backend_stats(self, backend):
-        """Accumulate cost and semantic execution time from backend's last operation."""
+        """Accumulate cost, semantic execution time, and API calls from backend's last operation."""
         if not self.enable_benchmarking:
             return
         if hasattr(backend, 'last_stats') and backend.last_stats:
             self._accumulated_cost += backend.last_stats.total_cost
             self._accumulated_latency += backend.last_stats.total_semantic_execution_time_seconds
+            self._accumulated_api_calls += backend.last_stats.api_calls
+            self._accumulated_embedding_calls += backend.last_stats.embedding_calls
             logger.debug(f"Operation stats - Cost: ${backend.last_stats.total_cost:.6f}, "
-                        f"Semantic Time: {backend.last_stats.total_semantic_execution_time_seconds:.2f}s")
+                        f"Semantic Time: {backend.last_stats.total_semantic_execution_time_seconds:.2f}s, "
+                        f"API Calls: {backend.last_stats.api_calls}, "
+                        f"Embedding Calls: {backend.last_stats.embedding_calls}")
     
     def _track_sql_execution(self, func, *args, **kwargs):
         """Track SQL execution time for non-semantic operations."""
@@ -1433,16 +1439,81 @@ class SaberEngine:
                         # Try to extract what columns are actually being selected
                         select_match = re.search(r'SELECT\s+(.*?)\s+FROM', final_query, re.IGNORECASE | re.DOTALL)
                         if select_match:
-                            requested_cols = [col.strip() for col in select_match.group(1).split(',')]
-                            logger.warning(f"Requested columns: {requested_cols}")
+                            requested_cols_str = [col.strip() for col in select_match.group(1).split(',')]
+                            logger.warning(f"Requested columns: {requested_cols_str}")
                             
-                            # Check if any requested columns don't exist in current_df
-                            missing_cols = [col for col in requested_cols if col not in current_df.columns and col != '*' and col != 'DISTINCT']
-                            if missing_cols:
-                                logger.error(f"Missing columns in result DataFrame: {missing_cols}")
-                                logger.error(f"This likely means the backend semantic operation failed to create the expected columns")
-                                # Return the current_df directly instead of trying to SELECT
-                                logger.warning("Returning current DataFrame directly instead of executing SELECT")
+                            # Parse the column specifications to extract actual column names and aliases
+                            actual_select_cols = []
+                            for col_spec in requested_cols_str:
+                                if col_spec == '*' or col_spec.upper() == 'DISTINCT':
+                                    continue
+                                # Check for AS alias: "column AS alias" -> use "column"
+                                as_match = re.search(r'(\S+)\s+AS\s+(\w+)', col_spec, re.IGNORECASE)
+                                if as_match:
+                                    # Use the base column name
+                                    actual_select_cols.append((as_match.group(1), as_match.group(2)))
+                                else:
+                                    # Just a plain column reference
+                                    actual_select_cols.append((col_spec, col_spec))
+                            
+                            # Check which columns exist in the DataFrame
+                            available_cols = set(current_df.columns)
+                            select_cols_for_df = []
+                            rename_map = {}
+                            
+                            for col_name, alias in actual_select_cols:
+                                if col_name in available_cols:
+                                    select_cols_for_df.append(col_name)
+                                    if alias != col_name:
+                                        rename_map[col_name] = alias
+                                else:
+                                    logger.warning(f"Column '{col_name}' not found in DataFrame, skipping")
+                            
+                            if select_cols_for_df:
+                                # Select only the requested columns and apply aliases
+                                logger.info(f"Selecting columns from DataFrame: {select_cols_for_df}")
+                                result_df = current_df[select_cols_for_df].copy()
+                                if rename_map:
+                                    result_df = result_df.rename(columns=rename_map)
+                                
+                                # Apply ORDER BY if present in the query
+                                order_match = re.search(r'ORDER\s+BY\s+(.+?)(?:\s+LIMIT|\s*$)', final_query, re.IGNORECASE)
+                                if order_match:
+                                    order_clause = order_match.group(1).strip()
+                                    # Parse: column DESC/ASC
+                                    order_parts = order_clause.split(',')
+                                    order_cols = []
+                                    order_ascending = []
+                                    for part in order_parts:
+                                        part = part.strip()
+                                        if ' DESC' in part.upper():
+                                            col = part.replace('DESC', '').replace('desc', '').strip()
+                                            order_cols.append(col)
+                                            order_ascending.append(False)
+                                        elif ' ASC' in part.upper():
+                                            col = part.replace('ASC', '').replace('asc', '').strip()
+                                            order_cols.append(col)
+                                            order_ascending.append(True)
+                                        else:
+                                            order_cols.append(part)
+                                            order_ascending.append(True)
+                                    
+                                    # Filter to only columns that exist
+                                    valid_order_cols = [col for col in order_cols if col in result_df.columns]
+                                    if valid_order_cols:
+                                        valid_ascending = [order_ascending[i] for i, col in enumerate(order_cols) if col in result_df.columns]
+                                        result_df = result_df.sort_values(by=valid_order_cols, ascending=valid_ascending)
+                                
+                                # Apply LIMIT if present
+                                limit_match = re.search(r'LIMIT\s+(\d+)', final_query, re.IGNORECASE)
+                                if limit_match:
+                                    limit = int(limit_match.group(1))
+                                    result_df = result_df.head(limit)
+                                
+                                logger.info("Returning DataFrame with selected columns and applied ORDER/LIMIT")
+                                return result_df
+                            else:
+                                logger.error("No valid columns found for selection")
                                 return current_df
                             
                             # Fallback: just select all columns from current_df
@@ -1861,6 +1932,8 @@ class SaberEngine:
         self._accumulated_latency = 0.0
         self._accumulated_sql_time = 0.0
         self._accumulated_rewriting_time = 0.0
+        self._accumulated_api_calls = 0
+        self._accumulated_embedding_calls = 0
         # Reset LOTUS LM stats
         if hasattr(self, 'lm') and hasattr(self.lm, 'reset_stats'):
             self.lm.reset_stats()
@@ -1902,7 +1975,9 @@ class SaberEngine:
                 total_execution_time_seconds=elapsed_time,
                 total_semantic_execution_time_seconds=self._accumulated_latency,
                 total_non_semantic_execution_time_seconds=self._accumulated_sql_time,
-                total_rewriting_time_seconds=self._accumulated_rewriting_time
+                total_rewriting_time_seconds=self._accumulated_rewriting_time,
+                api_calls=self._accumulated_api_calls,
+                embedding_calls=self._accumulated_embedding_calls
             )
             
             return result, stats
@@ -1940,7 +2015,9 @@ class SaberEngine:
                 total_cost=self._accumulated_cost,
                 total_semantic_execution_time_seconds=self._accumulated_latency,
                 total_non_semantic_execution_time_seconds=self._accumulated_sql_time,
-                total_rewriting_time_seconds=self._accumulated_rewriting_time
+                total_rewriting_time_seconds=self._accumulated_rewriting_time,
+                api_calls=self._accumulated_api_calls,
+                embedding_calls=self._accumulated_embedding_calls
             )
             
             return result, stats
