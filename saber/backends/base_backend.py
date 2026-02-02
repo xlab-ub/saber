@@ -76,8 +76,16 @@ class BaseBackend(ABC):
         pass
     
     @abstractmethod
-    def sem_where(self, df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
-        """Semantic filtering operation."""
+    def sem_where(self, df: pd.DataFrame, user_prompt: str, limit_hint: int = None) -> pd.DataFrame:
+        """Semantic filtering operation.
+        
+        Args:
+            df: Input DataFrame to filter
+            user_prompt: The semantic filter prompt with column placeholders
+            limit_hint: Optional hint for early termination. If provided, the filter
+                       may stop processing once enough matching rows are found.
+                       This is an optimization hint pushed down from LIMIT clauses.
+        """
         pass
     
     @abstractmethod
@@ -87,8 +95,19 @@ class BaseBackend(ABC):
     
     @abstractmethod
     def sem_join(self, df1: pd.DataFrame, df2: pd.DataFrame, user_prompt: str, 
-                df1_name: str = "left", df2_name: str = "right") -> pd.DataFrame:
-        """Semantic join operation."""
+                df1_name: str = "left", df2_name: str = "right",
+                limit_hint: Optional[int] = None) -> pd.DataFrame:
+        """Semantic join operation.
+        
+        Args:
+            df1: Left DataFrame
+            df2: Right DataFrame
+            user_prompt: The semantic join condition prompt
+            df1_name: Name/alias for the left table
+            df2_name: Name/alias for the right table
+            limit_hint: If set, use batched processing to limit LLM calls.
+                       Will attempt to find at least limit_hint matches.
+        """
         pass
     
     @abstractmethod

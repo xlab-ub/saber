@@ -3,15 +3,33 @@ SABER Engine Implementation
 """
 import re
 import time
+import warnings
 import pandas as pd
 from typing import Dict, Any, Optional, List
 import logging
+
+# Suppress Pydantic serialization warnings from LiteLLM responses
+# These occur because vLLM responses don't include all fields expected by LiteLLM's Pydantic models
+warnings.filterwarnings(
+    "ignore",
+    message="Pydantic serializer warnings:",
+    category=UserWarning,
+    module="pydantic"
+)
+
+# Suppress LOTUS cost calculation warnings (not critical for local LLM usage)
+warnings.filterwarnings(
+    "ignore",
+    message="Error calculating completion cost",
+    category=UserWarning,
+    module="lotus.models.lm"
+)
 
 import lotus
 from lotus.models import SentenceTransformersRM, LM, LiteLLMRM
 from lotus.vector_store import FaissVS 
 
-from .config import LOTUS_DEFAULT_RM_MODEL, LOCAL_EMBEDDING_MODEL
+from .config import LOTUS_DEFAULT_RM_MODEL, LOCAL_EMBEDDING_MODEL, MAX_TOKENS
 from .llm_config import get_default_llm_config
 from .backends import LOTUSBackend, DocETLBackend, PalimpzestBackend
 from .core import QueryRewriter, SQLParser, SemanticSetOperations, SemRewriter
@@ -70,7 +88,7 @@ class SaberEngine:
         
         # Initialize LOTUS settings
         lotus_config = self.llm_config.get_model_config('lotus')
-        self.lm = LM(model=lotus_config['model'], api_key=lotus_config['api_key'])
+        self.lm = LM(model=lotus_config['model'], api_key=lotus_config['api_key'], max_tokens=MAX_TOKENS)
         if use_local_llm:
             if LOCAL_EMBEDDING_MODEL.startswith("litellm_proxy"):
                 self.rm = LiteLLMRM(model=LOCAL_EMBEDDING_MODEL)
@@ -708,6 +726,184 @@ class SaberEngine:
             import traceback
             traceback.print_exc()
             raise
+    
+    def query_ibis(self, sql: str, explain: bool = False) -> pd.DataFrame:
+        """
+        Execute SQL using the Ibis + DuckDB + pandas pipeline.
+        
+        This pipeline treats semantic operations as first-class citizens with:
+        - Logical IR for both relational and semantic operators
+        - Plan optimization (predicate pushdown, projection pushdown, etc.)
+        - Segmented execution (DuckDB for relational, pandas for semantic)
+        - Explicit bridge operators between execution contexts
+        
+        Args:
+            sql: SQL query with SEM_* operations
+            explain: If True, print execution plan details
+            
+        Returns:
+            Query result as pandas DataFrame
+        """
+        from .ibis_pipeline import PipelineExecutor
+        
+        # Extract aliases for query rewriting context
+        aliases = self.sql_parser.extract_table_aliases(sql)
+        
+        # Patterns for backend-free semantic operations (support both single and double quotes)
+        simple_pattern = r"(SEM_(?:WHERE|SELECT))\s*\(\s*[\"']([^\"']*)[\"']\s*\)"
+        order_with_col_pattern = r"(SEM_ORDER_BY)\s*\(\s*([^,'\"]+)\s*,\s*[\"']([^\"']*)[\"']\s*\)"
+        order_no_col_pattern = r"(SEM_ORDER_BY)\s*\(\s*[\"']([^\"']*)[\"']\s*\)"
+        agg_with_col_pattern = r"(SEM_AGG)\s*\(\s*([^,'\"]+)\s*,\s*[\"']([^\"']*)[\"']\s*\)\s+AS\s+(\w+)"
+        agg_no_col_pattern = r"(SEM_AGG)\s*\(\s*[\"']([^\"']*)[\"']\s*\)\s+AS\s+(\w+)"
+        join_pattern = r"(SEM_JOIN)\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*[\"']([^\"']*)[\"']\s*\)"
+        
+        # Check if we have any backend-free operations
+        has_backend_free = (bool(re.search(simple_pattern, sql)) or 
+                           bool(re.search(order_with_col_pattern, sql)) or
+                           bool(re.search(order_no_col_pattern, sql)) or
+                           bool(re.search(agg_with_col_pattern, sql)) or
+                           bool(re.search(agg_no_col_pattern, sql)) or
+                           bool(re.search(join_pattern, sql)))
+        
+        # Handle regular JOINs first - create joined DataFrame with prefixed columns
+        join_info = self.sql_parser.extract_regular_join_info(sql)
+        joined_df = None
+        dataframes_to_use = self._dataframes.copy()
+        
+        if join_info:
+            modified_sql, joined_df = self._handle_regular_joins(sql)
+            if joined_df is not None:
+                # Register the joined table for the Ibis pipeline
+                temp_table_name = f"temp_join_{join_info['left_table']}_{join_info['right_table']}"
+                dataframes_to_use[temp_table_name] = joined_df
+                sql = modified_sql
+                logging.info(f"Created joined table '{temp_table_name}' with columns: {list(joined_df.columns)}")
+        
+        # Handle backend-free queries by rewriting them
+        if has_backend_free:
+            rewriting_start = time.time() if self.enable_benchmarking else None
+            
+            # Check if we have JOINs to determine the correct column context
+            if join_info:
+                column_context = self._get_join_column_context(join_info)
+            else:
+                column_context = get_column_context(self._dataframes)
+            
+            # Rewrite SEM_WHERE and SEM_SELECT
+            def rewrite_simple_match(match):
+                func_name = match.group(1)
+                user_prompt = match.group(2)
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, column_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                return f"{func_name}('{rewritten_prompt_escaped}', '{self.default_backend}')"
+            
+            sql = re.sub(simple_pattern, rewrite_simple_match, sql)
+            
+            # Rewrite SEM_ORDER_BY with column
+            def rewrite_order_with_col(match):
+                func_name = match.group(1)
+                column = match.group(2).strip()
+                user_prompt = match.group(3)
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, column_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                if self.default_backend == 'lotus':
+                    return f"{func_name}('{rewritten_prompt_escaped}', '{self.default_backend}')"
+                else:
+                    return f"{func_name}({column}, '{rewritten_prompt_escaped}', '{self.default_backend}')"
+            
+            sql = re.sub(order_with_col_pattern, rewrite_order_with_col, sql)
+            
+            # Rewrite SEM_ORDER_BY without column
+            def rewrite_order_no_col(match):
+                func_name = match.group(1)
+                user_prompt = match.group(2)
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, column_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                return f"{func_name}('{rewritten_prompt_escaped}', '{self.default_backend}')"
+            
+            sql = re.sub(order_no_col_pattern, rewrite_order_no_col, sql)
+            
+            # Rewrite SEM_AGG with column
+            def rewrite_agg_with_col(match):
+                func_name = match.group(1)
+                column = match.group(2).strip()
+                user_prompt = match.group(3)
+                alias = match.group(4)
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, column_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                if self.default_backend == 'lotus':
+                    return f"{func_name}('{rewritten_prompt_escaped}', '{self.default_backend}') AS {alias}"
+                else:
+                    return f"{func_name}({column}, '{rewritten_prompt_escaped}', '{self.default_backend}') AS {alias}"
+            
+            sql = re.sub(agg_with_col_pattern, rewrite_agg_with_col, sql)
+            
+            # Rewrite SEM_AGG without column
+            def rewrite_agg_no_col(match):
+                func_name = match.group(1)
+                user_prompt = match.group(2)
+                alias = match.group(3)
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, column_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                return f"{func_name}('{rewritten_prompt_escaped}', '{self.default_backend}') AS {alias}"
+            
+            sql = re.sub(agg_no_col_pattern, rewrite_agg_no_col, sql)
+            
+            # Rewrite SEM_JOIN
+            def rewrite_join(match):
+                func_name = match.group(1)
+                left_table = match.group(2).strip()
+                right_table = match.group(3).strip()
+                user_prompt = match.group(4)
+                
+                if left_table in self._dataframes and right_table in self._dataframes:
+                    left_df = self._dataframes[left_table]
+                    right_df = self._dataframes[right_table]
+                    join_context = f"Left table ({left_table}) columns: {', '.join(left_df.columns)}\n"
+                    join_context += f"Right table ({right_table}) columns: {', '.join(right_df.columns)}"
+                else:
+                    join_context = column_context
+                
+                rewritten_prompt = self.rewrite_prompt(
+                    user_prompt, join_context, aliases, self.default_backend, operation=func_name
+                )
+                rewritten_prompt_escaped = rewritten_prompt.replace("'", "''")
+                return f"{func_name}({left_table}, {right_table}, '{rewritten_prompt_escaped}', '{self.default_backend}')"
+            
+            sql = re.sub(join_pattern, rewrite_join, sql)
+            
+            if rewriting_start is not None:
+                self._accumulated_rewriting_time += time.time() - rewriting_start
+            
+            logging.info(f"Rewritten SQL for Ibis pipeline:\n{sql}\n")
+        
+        # Create and execute with the Ibis pipeline
+        executor = PipelineExecutor(
+            db_adapter=self.db_adapter,
+            backends=self.backends,
+            dataframes=dataframes_to_use,
+            semantic_ops=self.semantic_ops,
+            rm=self.rm
+        )
+        
+        result = executor.execute(sql, explain=explain)
+        
+        # Accumulate stats if benchmarking
+        if self.enable_benchmarking:
+            self._accumulated_sql_time += executor.stats.duckdb_time_ms / 1000.0
+            self._accumulated_latency += executor.stats.semantic_time_ms / 1000.0
+        
+        return result
     
     def _execute_with_semantic_ops(self, canonical_sql: str, operations: List) -> pd.DataFrame:
         # Check if the final SELECT contains a JOIN
@@ -2023,4 +2219,40 @@ class SaberEngine:
             return result, stats
         finally:
             # Restore original benchmarking state
+            self.enable_benchmarking = original_state    
+    def query_ibis_with_benchmark(self, sql: str, reset: bool = True, explain: bool = False) -> tuple[pd.DataFrame, BenchmarkStats]:
+        """
+        Execute query with Ibis pipeline and return results with benchmark statistics.
+        
+        Args:
+            sql: SQL query to execute
+            reset: Reset stats before execution (default: True)
+            explain: Whether to print execution plan (default: False)
+            
+        Returns:
+            Tuple of (result DataFrame, BenchmarkStats with cost and latency)
+        """
+        original_state = self.enable_benchmarking
+        self.enable_benchmarking = True
+        
+        try:
+            if reset:
+                self.reset_benchmark()
+            
+            start_time = time.time()
+            result = self.query_ibis(sql, explain=explain)
+            elapsed_time = time.time() - start_time
+            
+            stats = BenchmarkStats(
+                total_execution_time_seconds=elapsed_time,
+                total_cost=self._accumulated_cost,
+                total_semantic_execution_time_seconds=self._accumulated_latency,
+                total_non_semantic_execution_time_seconds=self._accumulated_sql_time,
+                total_rewriting_time_seconds=self._accumulated_rewriting_time,
+                api_calls=self._accumulated_api_calls,
+                embedding_calls=self._accumulated_embedding_calls
+            )
+            
+            return result, stats
+        finally:
             self.enable_benchmarking = original_state

@@ -350,8 +350,89 @@ class LOTUSBackend(BaseBackend):
         
         return prompt
     
-    def sem_where(self, df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
-        """Semantic filtering using LOTUS."""
+    def _sem_filter_with_limit(self, df: pd.DataFrame, prompt: str, limit: int) -> pd.DataFrame:
+        """Execute semantic filter with early termination via iterative batching.
+        
+        This optimization processes the DataFrame in batches and stops once
+        enough matching rows are found. This can significantly reduce the
+        number of LLM calls for queries with small LIMIT values.
+        
+        Args:
+            df: Input DataFrame (already prepared for LOTUS)
+            prompt: The semantic filter prompt
+            limit: Target number of matching rows to find
+            
+        Returns:
+            DataFrame with at least `limit` matching rows (if available),
+            or all matching rows if fewer than `limit` exist.
+        """
+        import lotus
+        
+        total_rows = len(df)
+        
+        # If DataFrame is small enough, just process all at once
+        # Threshold: 2x the limit or 100 rows, whichever is smaller
+        small_df_threshold = min(limit * 2, 100)
+        if total_rows <= small_df_threshold:
+            logger.debug(f"DataFrame small ({total_rows} rows), processing all at once")
+            return df.sem_filter(prompt)
+        
+        # For larger DataFrames, use iterative batch processing
+        # Batch size: Start with 2x the limit to account for selectivity,
+        # but ensure minimum of 50 rows per batch for efficiency
+        batch_size = max(limit * 2, 50)
+        
+        collected_results = []
+        collected_count = 0
+        processed_rows = 0
+        
+        logger.info(f"LIMIT pushdown enabled: targeting {limit} rows from {total_rows} total")
+        
+        while processed_rows < total_rows and collected_count < limit:
+            # Get the next batch
+            batch_end = min(processed_rows + batch_size, total_rows)
+            batch_df = df.iloc[processed_rows:batch_end].copy()
+            
+            logger.debug(f"Processing batch [{processed_rows}:{batch_end}] ({len(batch_df)} rows)")
+            
+            # Apply semantic filter to this batch
+            batch_result = batch_df.sem_filter(prompt)
+            
+            # Collect results
+            if not batch_result.empty:
+                collected_results.append(batch_result)
+                collected_count += len(batch_result)
+                logger.debug(f"Batch yielded {len(batch_result)} matches, total: {collected_count}/{limit}")
+            
+            processed_rows = batch_end
+            
+            # Early termination: we have enough results
+            if collected_count >= limit:
+                logger.info(f"Early termination: found {collected_count} matches after processing "
+                           f"{processed_rows}/{total_rows} rows ({100*processed_rows/total_rows:.1f}%)")
+                break
+        
+        # Combine all collected results
+        if collected_results:
+            result = pd.concat(collected_results, ignore_index=True)
+            # Trim to exactly the limit if we got more
+            if len(result) > limit:
+                result = result.head(limit)
+            return result
+        else:
+            # Return empty DataFrame with correct columns
+            return pd.DataFrame(columns=df.columns)
+
+    def sem_where(self, df: pd.DataFrame, user_prompt: str, limit_hint: int = None) -> pd.DataFrame:
+        """Semantic filtering using LOTUS.
+        
+        Args:
+            df: Input DataFrame to filter
+            user_prompt: The semantic filter prompt with column placeholders
+            limit_hint: Optional hint for early termination. If provided, the filter
+                       will stop processing once enough matching rows are found.
+                       This is an optimization hint pushed down from LIMIT clauses.
+        """
         def _operation():
             df_lotus, column_mapping = self.prepare_dataframe(df)
             updated_prompt = self.update_prompt(user_prompt, column_mapping)
@@ -380,7 +461,12 @@ class LOTUSBackend(BaseBackend):
             # Validate column references before executing
             updated_prompt = self._validate_column_references(updated_prompt, df_lotus, "SEM_WHERE")
             
-            result_df_lotus = df_lotus.sem_filter(updated_prompt)
+            # If limit_hint is provided, use iterative batch processing for early termination
+            if limit_hint is not None and limit_hint > 0:
+                result_df_lotus = self._sem_filter_with_limit(df_lotus, updated_prompt, limit_hint)
+            else:
+                result_df_lotus = df_lotus.sem_filter(updated_prompt)
+            
             result_df = self.restore_dataframe(result_df_lotus, column_mapping)
             
             # Ensure columns are preserved even when empty
@@ -405,6 +491,53 @@ class LOTUSBackend(BaseBackend):
         except Exception as e:
             logging.error(f"Error during LOTUS SEM_WHERE: {e}")
             raise RuntimeError(f"LOTUS SEM_WHERE execution failed: {str(e)}") from e
+    
+    def sem_where_marker(self, df: pd.DataFrame, user_prompt: str, result_column: str = "_sem_where_result") -> pd.DataFrame:
+        """Semantic filter marker - adds boolean column instead of filtering rows.
+        
+        Used when SEM_WHERE appears in SELECT clause (e.g., CASE WHEN SEM_WHERE(...)).
+        Preserves all rows and adds a result column with True/False based on the filter.
+        
+        Args:
+            df: Input DataFrame
+            user_prompt: The semantic filter prompt with column placeholders
+            result_column: Name of the column to add with boolean results
+        
+        Returns:
+            DataFrame with all original rows plus a boolean result column
+        """
+        def _operation():
+            df_lotus, column_mapping = self.prepare_dataframe(df)
+            updated_prompt = self.update_prompt(user_prompt, column_mapping)
+            
+            # Check if we have column placeholders
+            if '{' not in updated_prompt:
+                text_cols = [col for col in df_lotus.columns if df_lotus[col].dtype == 'object']
+                if text_cols:
+                    logger.warning(f"No column references found. Using first text column {{{text_cols[0]}}}")
+                    updated_prompt = f"{{{text_cols[0]}}} {updated_prompt}"
+            
+            # Validate column references before executing
+            updated_prompt = self._validate_column_references(updated_prompt, df_lotus, "SEM_WHERE_MARKER")
+            
+            # Use sem_filter to get the matching rows
+            filtered_df = df_lotus.sem_filter(updated_prompt)
+            
+            # Get the indices of matching rows
+            matching_indices = set(filtered_df.index)
+            
+            # Create result column: True for matching rows, False otherwise
+            result_df = df.copy()
+            result_df[result_column] = result_df.index.isin(matching_indices)
+            
+            logging.info(f"Result of LOTUS SEM_WHERE_MARKER: {result_df[result_column].sum()} True out of {len(result_df)} rows")
+            return result_df
+        
+        try:
+            return self._track_operation(_operation)
+        except Exception as e:
+            logging.error(f"Error during LOTUS SEM_WHERE_MARKER: {e}")
+            raise RuntimeError(f"LOTUS SEM_WHERE_MARKER execution failed: {str(e)}") from e
     
     def sem_select(self, df: pd.DataFrame, user_prompt: str, alias: str) -> pd.DataFrame:
         """Semantic selection using LOTUS."""
@@ -470,8 +603,20 @@ class LOTUSBackend(BaseBackend):
             raise  # Re-raise the exception instead of returning original df
     
     def sem_join(self, df1: pd.DataFrame, df2: pd.DataFrame, user_prompt: str,
-                df1_name: str = "left", df2_name: str = "right") -> pd.DataFrame:
-        """Semantic join using LOTUS."""
+                df1_name: str = "left", df2_name: str = "right",
+                limit_hint: Optional[int] = None) -> pd.DataFrame:
+        """Semantic join using LOTUS.
+        
+        Args:
+            df1: Left DataFrame
+            df2: Right DataFrame  
+            user_prompt: The semantic join condition prompt
+            df1_name: Name/alias for the left table
+            df2_name: Name/alias for the right table
+            limit_hint: If set, use batched processing to limit LLM calls.
+                       Will attempt to find at least limit_hint matches
+                       using a multiplicative sampling approach.
+        """
         def rename_sem_join_columns(df, left_table, right_table, separator=':'):
             new_columns = []
             for col in df.columns:
@@ -483,9 +628,112 @@ class LOTUSBackend(BaseBackend):
             return df
         
         def _operation():
-            result_df_lotus = df1.sem_join(df2, user_prompt)
+            # If no limit hint or small tables, do full join
+            if limit_hint is None or (len(df1) * len(df2) <= 1000):
+                result_df_lotus = df1.sem_join(df2, user_prompt)
+                return rename_sem_join_columns(result_df_lotus, df1_name, df2_name)
+            
+            # Batched approach for limit optimization
+            # Strategy: Start with a sample, expand if needed
+            results = []
+            total_matches = 0
+            
+            # Estimate batch sizes using a multiplicative factor
+            # Start with sqrt(limit) from each table, expand if needed
+            import math
+            
+            # Initial batch sizes - use multiplicative factor of the limit
+            # Since not all pairs match, we need more rows to find enough matches
+            expansion_factor = 3  # Start with 3x to have buffer for non-matches
+            initial_left_size = min(len(df1), max(10, limit_hint * expansion_factor))
+            initial_right_size = min(len(df2), max(10, limit_hint * expansion_factor))
+            
+            left_processed = 0
+            right_processed = 0
+            
+            # First batch - sample from both tables
+            left_batch = df1.iloc[:initial_left_size]
+            right_batch = df2.iloc[:initial_right_size]
+            
+            logger.info(f"SEM_JOIN with limit_hint={limit_hint}: Starting with batch sizes "
+                       f"left={len(left_batch)}/{len(df1)}, right={len(right_batch)}/{len(df2)}")
+            
+            result_df_lotus = left_batch.sem_join(right_batch, user_prompt)
             result_df = rename_sem_join_columns(result_df_lotus, df1_name, df2_name)
-            return result_df
+            total_matches = len(result_df)
+            
+            if total_matches > 0:
+                results.append(result_df)
+            
+            left_processed = len(left_batch)
+            right_processed = len(right_batch)
+            
+            # If we have enough matches, return early
+            if total_matches >= limit_hint:
+                logger.info(f"SEM_JOIN early termination: Found {total_matches} matches "
+                           f"with {left_processed}x{right_processed} = {left_processed * right_processed} LLM calls "
+                           f"(saved {len(df1) * len(df2) - left_processed * right_processed} calls)")
+                combined = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+                return combined.head(limit_hint) if len(combined) > limit_hint else combined
+            
+            # Expand batches iteratively if needed
+            max_iterations = 5  # Prevent infinite loops
+            iteration = 0
+            
+            while total_matches < limit_hint and iteration < max_iterations:
+                iteration += 1
+                
+                # Expand: double the batch sizes
+                new_left_end = min(len(df1), left_processed * 2)
+                new_right_end = min(len(df2), right_processed * 2)
+                
+                # If we can't expand anymore, break
+                if new_left_end == left_processed and new_right_end == right_processed:
+                    logger.info(f"SEM_JOIN: All rows processed, found {total_matches} matches")
+                    break
+                
+                # Process new left rows with all processed right rows
+                if new_left_end > left_processed:
+                    left_new = df1.iloc[left_processed:new_left_end]
+                    right_old = df2.iloc[:right_processed]
+                    
+                    if len(left_new) > 0 and len(right_old) > 0:
+                        result_df_lotus = left_new.sem_join(right_old, user_prompt)
+                        result_df = rename_sem_join_columns(result_df_lotus, df1_name, df2_name)
+                        if len(result_df) > 0:
+                            results.append(result_df)
+                            total_matches += len(result_df)
+                
+                # Process new right rows with all left rows (including new ones)
+                if new_right_end > right_processed:
+                    left_all = df1.iloc[:new_left_end]
+                    right_new = df2.iloc[right_processed:new_right_end]
+                    
+                    if len(left_all) > 0 and len(right_new) > 0:
+                        result_df_lotus = left_all.sem_join(right_new, user_prompt)
+                        result_df = rename_sem_join_columns(result_df_lotus, df1_name, df2_name)
+                        if len(result_df) > 0:
+                            results.append(result_df)
+                            total_matches += len(result_df)
+                
+                left_processed = new_left_end
+                right_processed = new_right_end
+                
+                logger.info(f"SEM_JOIN iteration {iteration}: {total_matches} matches found, "
+                           f"processed {left_processed}x{right_processed}")
+                
+                if total_matches >= limit_hint:
+                    break
+            
+            logger.info(f"SEM_JOIN completed: Found {total_matches} matches "
+                       f"with {left_processed}x{right_processed} rows processed "
+                       f"(full join would be {len(df1)}x{len(df2)})")
+            
+            combined = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+            # Remove potential duplicates from overlapping batches
+            if not combined.empty:
+                combined = combined.drop_duplicates()
+            return combined.head(limit_hint) if limit_hint and len(combined) > limit_hint else combined
         
         try: 
             return self._track_operation(_operation)
